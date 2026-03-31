@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Voice Assistant</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        .container {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 600px;
+        }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        select, button {
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            font-size: 16px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+        .mic-button {
+            background-color: #e74c3c;
+            border-radius: 50%;
+            width: 80px;
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 20px auto;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .mic-button.recording {
+            animation: pulse 1.5s infinite;
+            background-color: #c0392b;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
+            70% { transform: scale(1.1); box-shadow: 0 0 0 15px rgba(231, 76, 60, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
+        }
+        .chat-box {
+            border: 1px solid #eee;
+            border-radius: 5px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            background-color: #fafafa;
+            margin-bottom: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .message {
+            padding: 10px 15px;
+            border-radius: 20px;
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+        .message.user {
+            background-color: #3498db;
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 5px;
+        }
+        .message.assistant {
+            background-color: #ecf0f1;
+            color: #333;
+            align-self: flex-start;
+            border-bottom-left-radius: 5px;
+        }
+        .status {
+            text-align: center;
+            font-size: 14px;
+            color: #7f8c8d;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Local Voice Assistant</h1>
+
+    <div class="container">
+        <div class="controls">
+            <label for="model-select">LM Studio Model:</label>
+            <select id="model-select">
+                <option value="">Loading models...</option>
+            </select>
+
+            <label for="voice-select">Voxtral TTS Voice:</label>
+            <select id="voice-select">
+                <option value="">Loading voices...</option>
+            </select>
+        </div>
+
+        <div class="chat-box" id="chat-box">
+            <!-- Messages will appear here -->
+        </div>
+
+        <button id="record-btn" class="mic-button">🎤</button>
+        <div id="status" class="status">Click to speak...</div>
+    </div>
+
+    <script>
+        let ws;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        // Audio playback queue
+        const audioQueue = [];
+        let isPlaying = false;
+
+        const modelSelect = document.getElementById('model-select');
+        const voiceSelect = document.getElementById('voice-select');
+        const recordBtn = document.getElementById('record-btn');
+        const statusText = document.getElementById('status');
+        const chatBox = document.getElementById('chat-box');
+
+        // Fetch models
+        async function fetchModels() {
+            try {
+                const res = await fetch('/api/models');
+                const data = await res.json();
+                modelSelect.innerHTML = '';
+                if (data.models && data.models.length > 0) {
+                    data.models.forEach(model => {
+                        const opt = document.createElement('option');
+                        opt.value = model;
+                        opt.textContent = model;
+                        modelSelect.appendChild(opt);
+                    });
+                } else {
+                    modelSelect.innerHTML = '<option value="">No models found</option>';
+                }
+            } catch (err) {
+                console.error("Error fetching models:", err);
+                modelSelect.innerHTML = '<option value="">Error loading models</option>';
+            }
+        }
+
+        // Fetch voices
+        async function fetchVoices() {
+            try {
+                const res = await fetch('/api/voices');
+                const data = await res.json();
+                voiceSelect.innerHTML = '';
+                if (data.voices && data.voices.length > 0) {
+                    data.voices.forEach(voice => {
+                        const opt = document.createElement('option');
+                        opt.value = voice;
+                        opt.textContent = voice;
+                        voiceSelect.appendChild(opt);
+                    });
+                    voiceSelect.value = "casual_female"; // Default
+                }
+            } catch (err) {
+                console.error("Error fetching voices:", err);
+            }
+        }
+
+        function setupWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            let currentAssistantMessageDiv = null;
+
+            ws.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "transcription") {
+                    addMessage(data.text, 'user');
+                    statusText.textContent = "Generating response...";
+                    currentAssistantMessageDiv = addMessage("", 'assistant'); // placeholder
+                }
+                else if (data.type === "llm_chunk") {
+                    if (currentAssistantMessageDiv) {
+                        currentAssistantMessageDiv.textContent += data.text;
+                        chatBox.scrollTop = chatBox.scrollHeight;
+                    }
+                }
+                else if (data.type === "tts_audio") {
+                    const audioBlob = b64toBlob(data.audio, 'audio/wav');
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    audioQueue.push(audioUrl);
+                    playNextAudio();
+                }
+                else if (data.type === "llm_done") {
+                    statusText.textContent = "Done. You can speak again.";
+                    currentAssistantMessageDiv = null;
+                }
+                else if (data.type === "error") {
+                    statusText.textContent = "Error: " + data.message;
+                    console.error(data.message);
+                }
+            };
+
+            ws.onclose = () => {
+                statusText.textContent = "Disconnected. Reconnecting...";
+                setTimeout(setupWebSocket, 3000);
+            };
+        }
+
+        function playNextAudio() {
+            if (isPlaying || audioQueue.length === 0) return;
+
+            isPlaying = true;
+            const audioUrl = audioQueue.shift();
+            const audio = new Audio(audioUrl);
+
+            audio.onended = () => {
+                isPlaying = false;
+                URL.revokeObjectURL(audioUrl);
+                playNextAudio();
+            };
+
+            audio.play().catch(err => {
+                console.error("Audio playback error:", err);
+                isPlaying = false;
+                playNextAudio();
+            });
+        }
+
+        function addMessage(text, sender) {
+            const div = document.createElement('div');
+            div.classList.add('message', sender);
+            div.textContent = text;
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return div;
+        }
+
+        // Convert base64 to Blob
+        function b64toBlob(b64Data, contentType='', sliceSize=512) {
+            const byteCharacters = atob(b64Data);
+            const byteArrays = [];
+
+            for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
+                const slice = byteCharacters.slice(offset, offset + sliceSize);
+                const byteNumbers = new Array(slice.length);
+                for (let i = 0; i < slice.length; i++) {
+                    byteNumbers[i] = slice.charCodeAt(i);
+                }
+                const byteArray = new Uint8Array(byteNumbers);
+                byteArrays.push(byteArray);
+            }
+
+            return new Blob(byteArrays, {type: contentType});
+        }
+
+        async function toggleRecording() {
+            if (!modelSelect.value) {
+                alert("Please select an LLM model first.");
+                return;
+            }
+
+            if (isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                recordBtn.classList.remove('recording');
+                statusText.textContent = "Transcribing...";
+            } else {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                    // We don't specify mimeType so the browser picks its default supported format
+                    // (e.g. video/mp4 for Safari iOS, audio/webm for Chrome)
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+
+                    mediaRecorder.ondataavailable = event => {
+                        audioChunks.push(event.data);
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        const mimeType = mediaRecorder.mimeType || 'audio/webm';
+                        const audioBlob = new Blob(audioChunks, { type: mimeType });
+                        const reader = new FileReader();
+                        reader.readAsDataURL(audioBlob);
+                        reader.onloadend = () => {
+                            const base64data = reader.result.split(',')[1];
+
+                            // Send to WS
+                            ws.send(JSON.stringify({
+                                audio: base64data,
+                                model_id: modelSelect.value,
+                                voice_id: voiceSelect.value
+                            }));
+                        };
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+
+                    mediaRecorder.start();
+                    isRecording = true;
+                    recordBtn.classList.add('recording');
+                    statusText.textContent = "Listening...";
+                } catch (err) {
+                    console.error("Error accessing microphone:", err);
+                    alert("Could not access microphone.");
+                }
+            }
+        }
+
+        recordBtn.addEventListener('click', toggleRecording);
+
+        // Init
+        window.onload = () => {
+            fetchModels();
+            fetchVoices();
+            setupWebSocket();
+        };
+
+    </script>
+</body>
+</html>
