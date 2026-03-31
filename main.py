@@ -64,6 +64,20 @@ async def get_models():
         logger.error(f"Error fetching models from LM Studio: {e}")
         return {"models": [], "error": str(e)}
 
+@app.get("/api/tts-models")
+async def get_tts_models():
+    """Fetch available models from the TTS server."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{VOXTRAL_TTS_BASE_URL}/models")
+            response.raise_for_status()
+            data = response.json()
+            models = [model["id"] for model in data.get("data", [])]
+            return {"models": models}
+    except Exception as e:
+        logger.error(f"Error fetching models from TTS server: {e}")
+        return {"models": [], "error": str(e)}
+
 @app.get("/api/voices")
 async def get_voices():
     """Return available preset voices for Voxtral TTS."""
@@ -77,13 +91,13 @@ async def get_voices():
     return {"voices": voices}
 
 
-async def generate_tts(text: str, voice: str) -> bytes:
+async def generate_tts(text: str, voice: str, model: str) -> bytes:
     """Send text to Voxtral TTS and return audio bytes."""
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             payload = {
                 "input": text,
-                "model": "mistralai/Voxtral-4B-TTS-2603",
+                "model": model,
                 "response_format": "wav",
                 "voice": voice,
             }
@@ -116,6 +130,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if "audio" in payload:
                 model_id = payload.get("model_id")
                 voice_id = payload.get("voice_id", "casual_female")
+                tts_model_id = payload.get("tts_model_id", "mistralai/Voxtral-4B-TTS-2603")
 
                 if not model_id:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No model selected."}))
@@ -189,7 +204,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                                 tts_text = current_chunk.strip()
                                                 if tts_text:
                                                     logger.info(f"Sending to TTS: {tts_text}")
-                                                    audio_content = await generate_tts(tts_text, voice_id)
+                                                    audio_content = await generate_tts(tts_text, voice_id, tts_model_id)
                                                     if audio_content:
                                                         await websocket.send_text(json.dumps({
                                                             "type": "tts_audio",
@@ -205,7 +220,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if current_chunk.strip():
                             tts_text = current_chunk.strip()
                             logger.info(f"Sending final chunk to TTS: {tts_text}")
-                            audio_content = await generate_tts(tts_text, voice_id)
+                            audio_content = await generate_tts(tts_text, voice_id, tts_model_id)
                             if audio_content:
                                 await websocket.send_text(json.dumps({
                                     "type": "tts_audio",
