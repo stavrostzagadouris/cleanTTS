@@ -33,8 +33,11 @@ pip install git+https://github.com/vllm-project/vllm-omni.git --upgrade
 
 # Start the vllm server for Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8000
+
+# Alternatively, you can run a smaller TTS model like Qwen3-TTS (vLLM will automatically download weights from Hugging Face):
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-Base --omni --port 8000
 ```
-*Note: The first time you run this, it will download the ~8GB model weights from Hugging Face.*
+*Note: The first time you run this, it will download the model weights from Hugging Face.*
 
 ### 3. Start the Web App
 
@@ -59,7 +62,15 @@ uvicorn main:app --host 0.0.0.0 --port 5000
 1. Open your web browser and go to `http://localhost:5000`.
 2. **From your phone:** Connect your phone to the same Wi-Fi network as your computer, and navigate to `http://<YOUR_COMPUTER_IP>:5000`.
 3. Select the LLM model from LM Studio.
-4. Select the Voxtral TTS voice you want to use.
-5. Click the **microphone icon** to start speaking, and click it again to stop and send your audio.
+4. Select the TTS model to use.
+5. Select the TTS voice you want to use (if applicable to your model).
+6. Click the **microphone icon** to start speaking, and click it again to stop and send your audio.
+
+## Troubleshooting
+
+- **`vllm serve` fails with `Failed to infer device type` or `ImportError('libcuda.so.1: cannot open shared object file: No such file or directory')`**:
+  This happens when the NVIDIA drivers or CUDA libraries are not accessible to the Python environment or system. If you're on Linux, make sure your NVIDIA drivers are correctly installed (`nvidia-smi`). If you are using Windows Subsystem for Linux (WSL), ensure that your drivers are up-to-date in Windows, as WSL relies on them.
+- **`Couldn't find ffmpeg or avconv`**:
+  You need to install `ffmpeg`. On Ubuntu/Debian/WSL, run: `sudo apt update && sudo apt install ffmpeg`.
 
 Enjoy your local voice assistant!

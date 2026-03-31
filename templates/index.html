@@ -122,6 +122,11 @@
                 <option value="">Loading models...</option>
             </select>
 
+            <label for="tts-model-select">TTS Model:</label>
+            <select id="tts-model-select">
+                <option value="">Loading TTS models...</option>
+            </select>
+
             <label for="voice-select">Voxtral TTS Voice:</label>
             <select id="voice-select">
                 <option value="">Loading voices...</option>
@@ -147,6 +152,7 @@
         let isPlaying = false;
 
         const modelSelect = document.getElementById('model-select');
+        const ttsModelSelect = document.getElementById('tts-model-select');
         const voiceSelect = document.getElementById('voice-select');
         const recordBtn = document.getElementById('record-btn');
         const statusText = document.getElementById('status');
@@ -171,6 +177,35 @@
             } catch (err) {
                 console.error("Error fetching models:", err);
                 modelSelect.innerHTML = '<option value="">Error loading models</option>';
+            }
+        }
+
+        // Fetch TTS models
+        async function fetchTTSModels() {
+            try {
+                const res = await fetch('/api/tts-models');
+                const data = await res.json();
+                ttsModelSelect.innerHTML = '';
+                if (data.models && data.models.length > 0) {
+                    data.models.forEach(model => {
+                        const opt = document.createElement('option');
+                        opt.value = model;
+                        opt.textContent = model;
+                        ttsModelSelect.appendChild(opt);
+                    });
+                } else {
+                    // Fallback option in case fetching fails or returns empty
+                    const opt = document.createElement('option');
+                    opt.value = 'mistralai/Voxtral-4B-TTS-2603';
+                    opt.textContent = 'mistralai/Voxtral-4B-TTS-2603';
+                    ttsModelSelect.appendChild(opt);
+                }
+            } catch (err) {
+                console.error("Error fetching TTS models:", err);
+                const opt = document.createElement('option');
+                opt.value = 'mistralai/Voxtral-4B-TTS-2603';
+                opt.textContent = 'mistralai/Voxtral-4B-TTS-2603 (Fallback)';
+                ttsModelSelect.appendChild(opt);
             }
         }
 
@@ -319,6 +354,7 @@
                             ws.send(JSON.stringify({
                                 audio: base64data,
                                 model_id: modelSelect.value,
+                                tts_model_id: ttsModelSelect.value,
                                 voice_id: voiceSelect.value
                             }));
                         };
@@ -341,6 +377,7 @@
         // Init
         window.onload = () => {
             fetchModels();
+            fetchTTSModels();
             fetchVoices();
             setupWebSocket();
         };
