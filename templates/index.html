@@ -245,13 +245,38 @@
                 }
                 else if (data.type === "llm_chunk") {
                     if (currentAssistantMessageDiv) {
-                        currentAssistantMessageDiv.textContent += data.text;
+                        if (data.is_reasoning) {
+                            // Reasoning/Thinking is styled differently
+                            let reasoningSpan = currentAssistantMessageDiv.querySelector('.reasoning');
+                            if (!reasoningSpan) {
+                                reasoningSpan = document.createElement('span');
+                                reasoningSpan.className = 'reasoning';
+                                reasoningSpan.style.color = '#7f8c8d';
+                                reasoningSpan.style.fontStyle = 'italic';
+                                reasoningSpan.style.display = 'block';
+                                reasoningSpan.style.marginBottom = '10px';
+                                reasoningSpan.style.fontSize = '0.9em';
+                                reasoningSpan.textContent = "Thinking: ";
+                                currentAssistantMessageDiv.appendChild(reasoningSpan);
+                            }
+                            reasoningSpan.textContent += data.text;
+                        } else {
+                            // Actual content
+                            let contentSpan = currentAssistantMessageDiv.querySelector('.content');
+                            if (!contentSpan) {
+                                contentSpan = document.createElement('span');
+                                contentSpan.className = 'content';
+                                currentAssistantMessageDiv.appendChild(contentSpan);
+                            }
+                            contentSpan.textContent += data.text;
+                        }
                         chatBox.scrollTop = chatBox.scrollHeight;
                     }
                 }
                 else if (data.type === "tts_audio") {
-                    const audioBlob = b64toBlob(data.audio, 'audio/wav');
-                    const audioUrl = URL.createObjectURL(audioBlob);
+                    console.log("Audio chunk received, adding to queue...");
+                    // More robust base64 to blob
+                    const audioUrl = `data:audio/wav;base64,${data.audio}`;
                     audioQueue.push(audioUrl);
                     playNextAudio();
                 }
@@ -278,9 +303,10 @@
             const audioUrl = audioQueue.shift();
             const audio = new Audio(audioUrl);
 
+            console.log("Playing audio chunk...");
             audio.onended = () => {
                 isPlaying = false;
-                URL.revokeObjectURL(audioUrl);
+                // No need to revoke for data URLs
                 playNextAudio();
             };
 
@@ -319,6 +345,10 @@
         }
 
         async function toggleRecording() {
+            if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                alert("Microphone access is usually blocked by browsers on non-HTTPS connections (except localhost). If this fails, try using an SSH tunnel or HTTPS.");
+            }
+
             if (!modelSelect.value) {
                 alert("Please select an LLM model first.");
                 return;
