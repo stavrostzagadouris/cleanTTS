@@ -1,417 +1,447 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Local Voice Assistant</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-            color: #333;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        h1 {
-            color: #2c3e50;
-            margin-bottom: 20px;
-        }
-        .container {
-            background-color: #fff;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            width: 100%;
-            max-width: 600px;
-        }
-        .controls {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        select, button {
-            padding: 10px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-            font-size: 16px;
-        }
-        button {
-            background-color: #3498db;
-            color: white;
-            border: none;
-            cursor: pointer;
-            transition: background-color 0.3s;
-        }
-        button:hover {
-            background-color: #2980b9;
-        }
-        button:disabled {
-            background-color: #95a5a6;
-            cursor: not-allowed;
-        }
-        .mic-button {
-            background-color: #e74c3c;
-            border-radius: 50%;
-            width: 80px;
-            height: 80px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 20px auto;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-        .mic-button.recording {
-            animation: pulse 1.5s infinite;
-            background-color: #c0392b;
-        }
-        @keyframes pulse {
-            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
-            70% { transform: scale(1.1); box-shadow: 0 0 0 15px rgba(231, 76, 60, 0); }
-            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
-        }
-        .chat-box {
-            border: 1px solid #eee;
-            border-radius: 5px;
-            padding: 15px;
-            height: 300px;
-            overflow-y: auto;
-            background-color: #fafafa;
-            margin-bottom: 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .message {
-            padding: 10px 15px;
-            border-radius: 20px;
-            max-width: 80%;
-            word-wrap: break-word;
-        }
-        .message.user {
-            background-color: #3498db;
-            color: white;
-            align-self: flex-end;
-            border-bottom-right-radius: 5px;
-        }
-        .message.assistant {
-            background-color: #ecf0f1;
-            color: #333;
-            align-self: flex-start;
-            border-bottom-left-radius: 5px;
-        }
-        .status {
-            text-align: center;
-            font-size: 14px;
-            color: #7f8c8d;
-            margin-top: 10px;
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cleanTTS</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-2: #1f232c;
+      --text: #e8eaed;
+      --muted: #8a93a3;
+      --accent: #5ea1ff;
+      --accent-strong: #2f7bff;
+      --danger: #e0485f;
+      --user: #2f7bff;
+      --assistant: #2a2f3a;
+      --ok: #4ec9b0;
+      --border: #2a2f3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+    }
+    .app {
+      width: 100%;
+      max-width: 760px;
+      display: grid;
+      gap: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: 0.2px; }
+    .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    select, input[type=text], input[type=number], button, textarea {
+      width: 100%;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    textarea { font-family: inherit; resize: vertical; }
+    button {
+      cursor: pointer;
+      background: var(--accent-strong);
+      color: white;
+      border: none;
+      transition: background 0.15s;
+    }
+    button:hover:not(:disabled) { background: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+    button.danger { background: var(--danger); }
+
+    .chat {
+      height: 320px;
+      overflow-y: auto;
+      padding: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .msg {
+      max-width: 85%;
+      padding: 9px 13px;
+      border-radius: 14px;
+      line-height: 1.4;
+      font-size: 14px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .msg.user { background: var(--user); color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
+    .msg.assistant { background: var(--assistant); align-self: flex-start; border-bottom-left-radius: 4px; }
+    .reasoning { color: var(--muted); font-style: italic; font-size: 12px; display: block; margin-bottom: 6px; }
+
+    .mic-row { display: flex; align-items: center; gap: 12px; }
+    .mic {
+      width: 64px; height: 64px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 26px; background: var(--danger); flex-shrink: 0;
+    }
+    .mic.recording { animation: pulse 1.4s infinite; }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(224, 72, 95, 0.7); }
+      70% { box-shadow: 0 0 0 18px rgba(224, 72, 95, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(224, 72, 95, 0); }
+    }
+    .status { color: var(--muted); font-size: 13px; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--danger); }
+
+    h2 { margin: 0 0 8px; font-size: 16px; }
+    .test-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+
+    code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  </style>
 </head>
 <body>
+  <div class="app">
+    <header>
+      <h1>cleanTTS</h1>
+      <div class="sub">Local voice assistant — Whisper + Kokoro + remote LLM. External tools can call <code>POST /v1/audio/speech</code>.</div>
+    </header>
 
-    <h1>Local Voice Assistant</h1>
-
-    <div class="container">
-        <div class="controls">
-            <label for="model-select">LM Studio Model:</label>
-            <select id="model-select">
-                <option value="">Loading models...</option>
-            </select>
-
-            <label for="tts-model-select">TTS Model:</label>
-            <select id="tts-model-select">
-                <option value="">Loading TTS models...</option>
-            </select>
-
-            <label for="voice-select">Voxtral TTS Voice:</label>
-            <select id="voice-select">
-                <option value="">Loading voices...</option>
-            </select>
+    <section class="panel">
+      <div class="row" style="margin-bottom: 12px;">
+        <div>
+          <label for="llm-backend">LLM server</label>
+          <select id="llm-backend"><option>Loading…</option></select>
         </div>
-
-        <div class="chat-box" id="chat-box">
-            <!-- Messages will appear here -->
+        <div>
+          <label for="llm-model">LLM model</label>
+          <select id="llm-model"><option>Loading…</option></select>
         </div>
+      </div>
 
-        <button id="record-btn" class="mic-button">🎤</button>
-        <div id="status" class="status">Click to speak...</div>
-    </div>
+      <div class="row" style="grid-template-columns: 1fr; margin-bottom: 12px;">
+        <div>
+          <label for="voice">Voice</label>
+          <select id="voice"><option>Loading…</option></select>
+        </div>
+      </div>
 
-    <script>
-        let ws;
-        let mediaRecorder;
-        let audioChunks = [];
-        let isRecording = false;
+      <div class="chat" id="chat"></div>
 
-        // Audio playback queue
-        const audioQueue = [];
-        let isPlaying = false;
+      <div class="mic-row" style="margin-top: 12px;">
+        <button id="mic" class="mic" title="Hold or click to talk">🎤</button>
+        <div style="flex: 1;">
+          <div id="status" class="status">Ready. Click the mic to talk.</div>
+        </div>
+        <button id="reset" class="ghost" style="width: auto;">New chat</button>
+      </div>
+    </section>
 
-        const modelSelect = document.getElementById('model-select');
-        const ttsModelSelect = document.getElementById('tts-model-select');
-        const voiceSelect = document.getElementById('voice-select');
-        const recordBtn = document.getElementById('record-btn');
-        const statusText = document.getElementById('status');
-        const chatBox = document.getElementById('chat-box');
+    <section class="panel">
+      <h2>Test TTS API</h2>
+      <div class="sub">Same endpoint your external tools should hit: <code>POST /v1/audio/speech</code></div>
+      <div class="row" style="margin-bottom: 10px;">
+        <div>
+          <label for="test-voice">Voice</label>
+          <select id="test-voice"><option>Loading…</option></select>
+        </div>
+        <div>
+          <label for="test-speed">Speed</label>
+          <input id="test-speed" type="number" step="0.1" min="0.25" max="4.0" value="1.0" />
+        </div>
+      </div>
+      <div class="test-row">
+        <textarea id="test-text" rows="2" placeholder="Type something to speak…">Third place, two seconds behind the leader. Keep pushing.</textarea>
+        <button id="test-speak" style="width: auto; align-self: stretch;">Speak</button>
+      </div>
+      <div id="test-status" class="status" style="margin-top: 8px;"></div>
+    </section>
+  </div>
 
-        // Fetch models
-        async function fetchModels() {
-            try {
-                const res = await fetch('/api/models');
-                const data = await res.json();
-                modelSelect.innerHTML = '';
-                if (data.models && data.models.length > 0) {
-                    data.models.forEach(model => {
-                        const opt = document.createElement('option');
-                        opt.value = model;
-                        opt.textContent = model;
-                        modelSelect.appendChild(opt);
-                    });
-                } else {
-                    modelSelect.innerHTML = '<option value="">No models found</option>';
-                }
-            } catch (err) {
-                console.error("Error fetching models:", err);
-                modelSelect.innerHTML = '<option value="">Error loading models</option>';
-            }
-        }
+<script>
+  const $ = (id) => document.getElementById(id);
+  const chat = $('chat');
+  const status = $('status');
+  const llmBackend = $('llm-backend');
+  const llmModel = $('llm-model');
+  const voiceSel = $('voice');
+  const testVoice = $('test-voice');
+  const micBtn = $('mic');
+  const resetBtn = $('reset');
+  const testBtn = $('test-speak');
+  const testText = $('test-text');
+  const testSpeed = $('test-speed');
+  const testStatus = $('test-status');
 
-        // Fetch TTS models
-        async function fetchTTSModels() {
-            try {
-                const res = await fetch('/api/tts-models');
-                const data = await res.json();
-                ttsModelSelect.innerHTML = '';
-                if (data.models && data.models.length > 0) {
-                    data.models.forEach(model => {
-                        const opt = document.createElement('option');
-                        opt.value = model;
-                        opt.textContent = model;
-                        ttsModelSelect.appendChild(opt);
-                    });
-                } else {
-                    // Fallback option in case fetching fails or returns empty
-                    const opt = document.createElement('option');
-                    opt.value = 'mistralai/Voxtral-4B-TTS-2603';
-                    opt.textContent = 'mistralai/Voxtral-4B-TTS-2603';
-                    ttsModelSelect.appendChild(opt);
-                }
-            } catch (err) {
-                console.error("Error fetching TTS models:", err);
-                const opt = document.createElement('option');
-                opt.value = 'mistralai/Voxtral-4B-TTS-2603';
-                opt.textContent = 'mistralai/Voxtral-4B-TTS-2603 (Fallback)';
-                ttsModelSelect.appendChild(opt);
-            }
-        }
+  let ws;
+  let mediaRecorder;
+  let audioChunks = [];
+  let recording = false;
+  let currentAssistantMsg = null;
 
-        // Fetch voices
-        async function fetchVoices() {
-            try {
-                const res = await fetch('/api/voices');
-                const data = await res.json();
-                voiceSelect.innerHTML = '';
-                if (data.voices && data.voices.length > 0) {
-                    data.voices.forEach(voice => {
-                        const opt = document.createElement('option');
-                        opt.value = voice;
-                        opt.textContent = voice;
-                        voiceSelect.appendChild(opt);
-                    });
-                    voiceSelect.value = "casual_female"; // Default
-                }
-            } catch (err) {
-                console.error("Error fetching voices:", err);
-            }
-        }
+  // Audio playback queue (so consecutive TTS chunks play in order)
+  const audioQueue = [];
+  let isPlaying = false;
 
-        function setupWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  function setStatus(text, kind = '') {
+    status.textContent = text;
+    status.className = 'status' + (kind ? ' ' + kind : '');
+  }
 
-            let currentAssistantMessageDiv = null;
+  function fillSelect(sel, items, fallback) {
+    sel.innerHTML = '';
+    const list = (items && items.length) ? items : (fallback || []);
+    if (!list.length) {
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '(none available)';
+      sel.appendChild(o);
+      return;
+    }
+    list.forEach((v) => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = v;
+      sel.appendChild(o);
+    });
+  }
 
-            ws.onmessage = async (event) => {
-                const data = JSON.parse(event.data);
+  async function loadBackends() {
+    try {
+      const r = await fetch('/api/llm-backends');
+      const data = await r.json();
+      const names = (data.backends || []).map((b) => b.name);
+      fillSelect(llmBackend, names, []);
+      if (data.default) llmBackend.value = data.default;
+    } catch (e) {
+      fillSelect(llmBackend, [], []);
+      setStatus('Could not load backend list: ' + e.message, 'err');
+    }
+    await loadLLMModels();
+  }
 
-                if (data.type === "transcription") {
-                    addMessage(data.text, 'user');
-                    statusText.textContent = "Generating response...";
-                    currentAssistantMessageDiv = addMessage("", 'assistant'); // placeholder
-                }
-                else if (data.type === "llm_chunk") {
-                    if (currentAssistantMessageDiv) {
-                        if (data.is_reasoning) {
-                            // Reasoning/Thinking is styled differently
-                            let reasoningSpan = currentAssistantMessageDiv.querySelector('.reasoning');
-                            if (!reasoningSpan) {
-                                reasoningSpan = document.createElement('span');
-                                reasoningSpan.className = 'reasoning';
-                                reasoningSpan.style.color = '#7f8c8d';
-                                reasoningSpan.style.fontStyle = 'italic';
-                                reasoningSpan.style.display = 'block';
-                                reasoningSpan.style.marginBottom = '10px';
-                                reasoningSpan.style.fontSize = '0.9em';
-                                reasoningSpan.textContent = "Thinking: ";
-                                currentAssistantMessageDiv.appendChild(reasoningSpan);
-                            }
-                            reasoningSpan.textContent += data.text;
-                        } else {
-                            // Actual content
-                            let contentSpan = currentAssistantMessageDiv.querySelector('.content');
-                            if (!contentSpan) {
-                                contentSpan = document.createElement('span');
-                                contentSpan.className = 'content';
-                                currentAssistantMessageDiv.appendChild(contentSpan);
-                            }
-                            contentSpan.textContent += data.text;
-                        }
-                        chatBox.scrollTop = chatBox.scrollHeight;
-                    }
-                }
-                else if (data.type === "tts_audio") {
-                    console.log("Audio chunk received, adding to queue...");
-                    // More robust base64 to blob
-                    const audioUrl = `data:audio/wav;base64,${data.audio}`;
-                    audioQueue.push(audioUrl);
-                    playNextAudio();
-                }
-                else if (data.type === "llm_done") {
-                    statusText.textContent = "Done. You can speak again.";
-                    currentAssistantMessageDiv = null;
-                }
-                else if (data.type === "error") {
-                    statusText.textContent = "Error: " + data.message;
-                    console.error(data.message);
-                }
-            };
+  async function loadLLMModels() {
+    const url = '/api/llm-models' + (llmBackend.value ? '?backend=' + encodeURIComponent(llmBackend.value) : '');
+    try {
+      const r = await fetch(url);
+      const data = await r.json();
+      fillSelect(llmModel, data.models, []);
+      const tag = data.backend ? ` [${data.backend}]` : '';
+      if (data.error) setStatus(`LLM unreachable${tag}: ${data.error}`, 'err');
+      else if (!data.models || !data.models.length) setStatus(`No models on ${data.backend}.`, 'err');
+      else setStatus(`Ready. ${data.models.length} model(s) on ${data.backend}.`, 'ok');
+    } catch (e) {
+      fillSelect(llmModel, [], []);
+      setStatus('Could not reach LLM: ' + e.message, 'err');
+    }
+  }
 
-            ws.onclose = () => {
-                statusText.textContent = "Disconnected. Reconnecting...";
-                setTimeout(setupWebSocket, 3000);
-            };
-        }
+  async function loadVoices() {
+    try {
+      const r = await fetch('/v1/voices');
+      const data = await r.json();
+      fillSelect(voiceSel, data.voices, []);
+      fillSelect(testVoice, data.voices, []);
+      if (data.default) {
+        voiceSel.value = data.default;
+        testVoice.value = data.default;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
 
-        function playNextAudio() {
-            if (isPlaying || audioQueue.length === 0) return;
+  function addMsg(text, role) {
+    const div = document.createElement('div');
+    div.classList.add('msg', role);
+    if (text) div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+    return div;
+  }
 
-            isPlaying = true;
-            const audioUrl = audioQueue.shift();
-            const audio = new Audio(audioUrl);
+  function ensureContent(div) {
+    let span = div.querySelector('.content');
+    if (!span) {
+      span = document.createElement('span');
+      span.className = 'content';
+      div.appendChild(span);
+    }
+    return span;
+  }
+  function ensureReasoning(div) {
+    let span = div.querySelector('.reasoning');
+    if (!span) {
+      span = document.createElement('span');
+      span.className = 'reasoning';
+      span.textContent = 'Thinking: ';
+      div.insertBefore(span, div.firstChild);
+    }
+    return span;
+  }
 
-            console.log("Playing audio chunk...");
-            audio.onended = () => {
-                isPlaying = false;
-                // No need to revoke for data URLs
-                playNextAudio();
-            };
+  function playNext() {
+    if (isPlaying || !audioQueue.length) return;
+    isPlaying = true;
+    const url = audioQueue.shift();
+    const a = new Audio(url);
+    a.onended = () => { isPlaying = false; playNext(); };
+    a.onerror = () => { isPlaying = false; playNext(); };
+    a.play().catch((e) => { console.error('play err', e); isPlaying = false; playNext(); });
+  }
 
-            audio.play().catch(err => {
-                console.error("Audio playback error:", err);
-                isPlaying = false;
-                playNextAudio();
-            });
-        }
+  function setupWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
 
-        function addMessage(text, sender) {
-            const div = document.createElement('div');
-            div.classList.add('message', sender);
-            div.textContent = text;
-            chatBox.appendChild(div);
-            chatBox.scrollTop = chatBox.scrollHeight;
-            return div;
-        }
+    ws.onopen = () => setStatus('Ready. Click the mic to talk.', 'ok');
+    ws.onclose = () => {
+      setStatus('Disconnected. Reconnecting…', 'err');
+      setTimeout(setupWS, 2000);
+    };
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      switch (data.type) {
+        case 'transcription':
+          addMsg(data.text, 'user');
+          setStatus('Generating response…');
+          currentAssistantMsg = addMsg('', 'assistant');
+          break;
+        case 'llm_chunk':
+          if (!currentAssistantMsg) currentAssistantMsg = addMsg('', 'assistant');
+          if (data.is_reasoning) {
+            ensureReasoning(currentAssistantMsg).textContent += data.text;
+          } else {
+            ensureContent(currentAssistantMsg).textContent += data.text;
+          }
+          chat.scrollTop = chat.scrollHeight;
+          break;
+        case 'tts_audio':
+          audioQueue.push(`data:audio/wav;base64,${data.audio}`);
+          playNext();
+          break;
+        case 'llm_done':
+          setStatus('Done. Click the mic again.', 'ok');
+          currentAssistantMsg = null;
+          break;
+        case 'reset_ack':
+          chat.innerHTML = '';
+          setStatus('Chat reset.', 'ok');
+          break;
+        case 'error':
+          setStatus('Error: ' + data.message, 'err');
+          break;
+      }
+    };
+  }
 
-        // Convert base64 to Blob
-        function b64toBlob(b64Data, contentType='', sliceSize=512) {
-            const byteCharacters = atob(b64Data);
-            const byteArrays = [];
+  async function toggleRecording() {
+    if (!llmModel.value) {
+      setStatus('Pick an LLM model first.', 'err');
+      return;
+    }
+    if (recording) {
+      mediaRecorder.stop();
+      recording = false;
+      micBtn.classList.remove('recording');
+      setStatus('Transcribing…');
+      return;
+    }
 
-            for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
-                const slice = byteCharacters.slice(offset, offset + sliceSize);
-                const byteNumbers = new Array(slice.length);
-                for (let i = 0; i < slice.length; i++) {
-                    byteNumbers[i] = slice.charCodeAt(i);
-                }
-                const byteArray = new Uint8Array(byteNumbers);
-                byteArrays.push(byteArray);
-            }
-
-            return new Blob(byteArrays, {type: contentType});
-        }
-
-        async function toggleRecording() {
-            if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-                alert("Microphone access is usually blocked by browsers on non-HTTPS connections (except localhost). If this fails, try using an SSH tunnel or HTTPS.");
-            }
-
-            if (!modelSelect.value) {
-                alert("Please select an LLM model first.");
-                return;
-            }
-
-            if (isRecording) {
-                mediaRecorder.stop();
-                isRecording = false;
-                recordBtn.classList.remove('recording');
-                statusText.textContent = "Transcribing...";
-            } else {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-                    // We don't specify mimeType so the browser picks its default supported format
-                    // (e.g. video/mp4 for Safari iOS, audio/webm for Chrome)
-                    mediaRecorder = new MediaRecorder(stream);
-                    audioChunks = [];
-
-                    mediaRecorder.ondataavailable = event => {
-                        audioChunks.push(event.data);
-                    };
-
-                    mediaRecorder.onstop = () => {
-                        const mimeType = mediaRecorder.mimeType || 'audio/webm';
-                        const audioBlob = new Blob(audioChunks, { type: mimeType });
-                        const reader = new FileReader();
-                        reader.readAsDataURL(audioBlob);
-                        reader.onloadend = () => {
-                            const base64data = reader.result.split(',')[1];
-
-                            // Send to WS
-                            ws.send(JSON.stringify({
-                                audio: base64data,
-                                model_id: modelSelect.value,
-                                tts_model_id: ttsModelSelect.value,
-                                voice_id: voiceSelect.value
-                            }));
-                        };
-                        stream.getTracks().forEach(track => track.stop());
-                    };
-
-                    mediaRecorder.start();
-                    isRecording = true;
-                    recordBtn.classList.add('recording');
-                    statusText.textContent = "Listening...";
-                } catch (err) {
-                    console.error("Error accessing microphone:", err);
-                    alert("Could not access microphone.");
-                }
-            }
-        }
-
-        recordBtn.addEventListener('click', toggleRecording);
-
-        // Init
-        window.onload = () => {
-            fetchModels();
-            fetchTTSModels();
-            fetchVoices();
-            setupWebSocket();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      audioChunks = [];
+      mediaRecorder.ondataavailable = (ev) => audioChunks.push(ev.data);
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        const fr = new FileReader();
+        fr.readAsDataURL(blob);
+        fr.onloadend = () => {
+          const b64 = fr.result.split(',')[1];
+          ws.send(JSON.stringify({
+            audio: b64,
+            llm_backend: llmBackend.value,
+            llm_model: llmModel.value,
+            voice: voiceSel.value,
+          }));
         };
+        stream.getTracks().forEach((t) => t.stop());
+      };
+      mediaRecorder.start();
+      recording = true;
+      micBtn.classList.add('recording');
+      setStatus('Listening… click again to stop.');
+    } catch (e) {
+      setStatus('Mic error: ' + e.message + ' (use http://localhost:5000)', 'err');
+    }
+  }
 
-    </script>
+  async function testTTS() {
+    const text = testText.value.trim();
+    if (!text) { testStatus.textContent = 'Type something first.'; return; }
+    testBtn.disabled = true;
+    testStatus.textContent = 'Synthesizing…';
+    const t0 = performance.now();
+    try {
+      const r = await fetch('/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: text,
+          voice: testVoice.value,
+          speed: parseFloat(testSpeed.value) || 1.0,
+        }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`${r.status}: ${txt}`);
+      }
+      const blob = await r.blob();
+      const ms = Math.round(performance.now() - t0);
+      testStatus.textContent = `Got ${blob.size} bytes in ${ms}ms`;
+      const url = URL.createObjectURL(blob);
+      const a = new Audio(url);
+      a.onended = () => URL.revokeObjectURL(url);
+      a.play();
+    } catch (e) {
+      testStatus.textContent = 'Error: ' + e.message;
+    } finally {
+      testBtn.disabled = false;
+    }
+  }
+
+  function reset() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'reset' }));
+    } else {
+      chat.innerHTML = '';
+    }
+  }
+
+  micBtn.addEventListener('click', toggleRecording);
+  resetBtn.addEventListener('click', reset);
+  testBtn.addEventListener('click', testTTS);
+  llmBackend.addEventListener('change', loadLLMModels);
+
+  loadBackends();
+  loadVoices();
+  setupWS();
+</script>
 </body>
 </html>

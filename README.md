@@ -1,74 +1,191 @@
-# Local Voice Assistant with Qwen3-TTS and vLLM
+# cleanTTS
 
-This project is a low-latency local voice assistant designed for a split-machine architecture. It runs transcription and voice generation on your local machine and the heavy language model on a remote server.
+A small Python webapp that runs a local voice assistant **and** exposes an
+OpenAI-compatible TTS API for any other tool to use.
 
-## 🏗️ Architecture
+- **STT**: `faster-whisper` (local, CUDA)
+- **TTS**: Kokoro-82M via the `kokoro` pip package (local, CUDA, ~300MB VRAM)
+- **LLM**: any OpenAI-compatible chat endpoint (vLLM, LM Studio, Ollama with
+  OpenAI shim, OpenRouter, etc.)
+- **Web**: FastAPI + a single HTML page
 
-1.  **Local Machine (e.g., RTX 3080, 10GB)**: 
-    - Runs the **Web App** (FastAPI).
-    - Runs **Faster-Whisper** for instant Speech-to-Text.
-    - Runs **Qwen3-TTS** via `vllm-omni` for "talking back".
-2.  **Remote Machine (e.g., RTX 5090 via Tailscale)**:
-    - Runs the **LLM** (Chat Model) via `vLLM`.
+One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 
 ---
 
-## 🛠️ Step 1: Remote LLM Setup (5090 Machine)
+## What you get
 
-Start your chat model on the remote server:
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Voice assistant UI (mic → STT → LLM → TTS) |
+| `WS /ws` | WebSocket for the voice assistant pipeline |
+| `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
+| `GET /v1/voices` | Available Kokoro voices |
+| `GET /v1/models` | OpenAI-compat model list (always returns `kokoro`) |
+| `GET /api/llm-models` | Discovery for the configured LLM backend |
+
+---
+
+## Setup
 
 ```bash
-vllm serve mistralai/Mistral-7B-Instruct-v0.3 --port 1234 --gpu-memory-utilization 0.9
+# create a venv inside the repo
+python3 -m venv venv
+
+# install PyTorch with CUDA wheels first (required so kokoro/whisper see CUDA)
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# everything else
+./venv/bin/pip install -r requirements.txt
+```
+
+System packages: `ffmpeg` is required so Whisper can decode the browser's
+WebM audio. Install with `sudo apt install ffmpeg` on Debian/Ubuntu.
+
+---
+
+## Configure
+
+Copy `.env.example` to `.env` and edit it (`.env` is gitignored):
+
+```bash
+cp .env.example .env
+```
+
+```env
+# JSON list of LLM backends. Each entry needs a name (shown in the UI dropdown)
+# and a URL pointing at any OpenAI-compatible /v1 endpoint (vLLM, LM Studio, Ollama, etc.).
+LLM_BACKENDS=[{"name":"5090","url":"http://100.x.y.z:1234/v1"},{"name":"3080","url":"http://100.x.y.z:1234/v1"}]
+
+# Single-backend fallback (used only if LLM_BACKENDS is unset or invalid)
+# LLM_BASE_URL=http://100.x.y.z:1234/v1
+
+WHISPER_MODEL=distil-large-v3                  # or 'small', 'medium', etc.
+WHISPER_DEVICE=cuda                            # or 'cpu'
+KOKORO_LANG=a                                  # a=US-English, b=UK, j=JP, z=Mandarin, ...
+DEFAULT_VOICE=af_bella
+SYSTEM_PROMPT=You are a helpful, concise voice assistant. Keep responses short and natural for speech.
+HOST=0.0.0.0
+PORT=5000
+```
+
+The UI shows a "LLM server" dropdown; switching it refetches that backend's
+model list. The first backend in the list is the default.
+
+---
+
+## Run
+
+```bash
+./venv/bin/python main.py
+```
+
+First start: Kokoro (~300MB) and Whisper (~1.5GB for `distil-large-v3`)
+download from HuggingFace into the local cache. Subsequent starts are fast.
+
+### Accessing the UI
+
+The browser **must** load the app from `localhost` (or HTTPS) — anything
+else and it'll block mic access. How to get there depends on where the
+browser is running:
+
+- **Same machine (Linux desktop, or macOS)**: just open
+  `http://localhost:5000`.
+- **Windows browser → WSL2**: still just `http://localhost:5000`. WSL2
+  forwards `localhost` from Windows to your WSL distro automatically — no
+  SSH needed. Don't use the WSL IP (e.g. `192.168.64.x`) or the Tailscale
+  IP, those will trigger the mic block. If forwarding ever flakes, run
+  `wsl --shutdown` in PowerShell and start WSL again.
+- **Phone / tablet / another machine on your LAN or Tailscale**: SSH-tunnel
+  so the device sees the app on its own `localhost`:
+  ```bash
+  ssh -L 5000:localhost:5000 stavros@<host-ip>
+  ```
+  Then open `http://localhost:5000` on the phone. Termius (iOS) and Termux
+  (Android) can both do this. Requires an SSH server running on the host —
+  either Windows OpenSSH server, or `sshd` inside WSL.
+
+External tools calling `POST /v1/audio/speech` are unaffected by all of
+this — they don't need a mic, so the LAN/Tailscale IP works fine for them.
+
+---
+
+## Calling the TTS API from your own tools
+
+Any OpenAI TTS client works. Plain `httpx`:
+
+```python
+import httpx, sounddevice as sd, soundfile as sf, io
+
+r = httpx.post("http://localhost:5000/v1/audio/speech", json={
+    "input": "Third place, two seconds behind the leader.",
+    "voice": "af_bella",
+    "speed": 1.1,
+})
+r.raise_for_status()
+audio, sr = sf.read(io.BytesIO(r.content))
+sd.play(audio, sr); sd.wait()
+```
+
+Or the OpenAI SDK:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
+audio = client.audio.speech.create(model="kokoro", voice="af_bella",
+                                   input="P1, you've got the lead!")
+audio.stream_to_file("out.wav")
+```
+
+Or `curl`:
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello world","voice":"af_bella"}' \
+  --output hello.wav
 ```
 
 ---
 
-## 🎙️ Step 2: Local TTS Setup (3080 Machine)
+## Voices
 
-### 1. Install System Dependencies
-Qwen3-TTS requires the CUDA toolkit for model compilation and audio libraries for processing:
+US English (`KOKORO_LANG=a`):
+`af_alloy af_aoede af_bella af_heart af_jessica af_kore af_nicole af_nova af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck am_santa`
 
-```bash
-sudo apt update
-sudo apt install -y ffmpeg sox nvidia-cuda-toolkit
-```
+UK English (`KOKORO_LANG=b`):
+`bf_alice bf_emma bf_isabella bf_lily bm_daniel bm_fable bm_george bm_lewis`
 
-### 2. Install vLLM-Omni
-```bash
-# Recommendation: Use a virtual environment
-pip install -U vllm
-pip install git+https://github.com/vllm-project/vllm-omni.git
-```
-
-### 3. Start Qwen3-TTS
-Since Whisper also uses the 3080, we limit vLLM's memory usage to 50%:
-
-```bash
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8000 --dtype bfloat16 --gpu-memory-utilization 0.5
-```
+Other Kokoro languages (`j`, `z`, `e`, `f`, `h`, `i`, `p`) work too — set
+`KOKORO_LANG` and pass any voice id Kokoro supports for that language.
 
 ---
 
-## 💻 Step 3: Web App Configuration
+## Architecture notes
 
-1.  Install app requirements: `pip install -r requirements.txt`
-2.  Configure your `.env` file:
-    ```env
-    # Remote IP of your 5090
-    LM_STUDIO_BASE_URL=http://100.x.y.z:1234/v1
+**Kokoro is pure TTS.** It has no understanding of the text — give it a
+string, get a waveform. All "thinking" happens in the LLM. This means:
 
-    # Stays localhost because TTS is running on the 3080
-    VOXTRAL_TTS_BASE_URL=http://localhost:8000/v1
+- For the voice assistant, the LLM (vLLM on your remote machine) generates
+  the reply, and Kokoro speaks it.
+- For external tools (race telemetry, alerts, etc.), your code already knows
+  what to say — just POST the string to `/v1/audio/speech`. **No LLM
+  required** for that path.
 
-    WHISPER_MODEL=distil-large-v3
-    WHISPER_DEVICE=cuda
-    ```
-3.  Run the app: `python run_test.py`
+**Sentence-level streaming.** During the voice assistant flow, LLM tokens
+are accumulated until a sentence boundary, at which point that sentence is
+queued for TTS while the LLM keeps generating. First audio plays before the
+LLM has finished thinking.
 
 ---
 
-## ⚠️ Key Learnings & Troubleshooting
+## Troubleshooting
 
-- **Microphone Security**: Browsers block mic access on `http://100.x.y.z`. You **must** access the UI via `http://localhost:5000`. If you are using a separate device (like a phone), use an SSH tunnel: `ssh -L 5000:localhost:5000 user@3080-ip`.
-- **NVCC Error**: If you see `InductorError: OSError: nvcc`, ensure `nvidia-cuda-toolkit` is installed or use the `--enforce-eager` flag in vLLM.
-- **VRAM Conflicts**: If the app crashes on the 3080, lower the `--gpu-memory-utilization` in the TTS command or change `WHISPER_MODEL` to `small` in `.env`.
+- **No mic in browser**: you're on `http://<lan-ip>:5000`. Use `localhost`
+  or HTTPS.
+- **CUDA OOM on the 3080**: switch `WHISPER_MODEL=small` or `tiny`.
+- **`OSError: PortAudio` / no sound**: check the browser's tab volume; the
+  audio is sent as base64 WAV over the WebSocket.
+- **Kokoro voice not found**: voice ids are case-sensitive and must match
+  the configured `KOKORO_LANG` (e.g. `bf_emma` requires `KOKORO_LANG=b`).

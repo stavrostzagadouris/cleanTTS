@@ -1,307 +1,378 @@
-import os
-from fastapi import FastAPI, WebSocket, Request, HTTPException, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from dotenv import load_dotenv
-import httpx
-from faster_whisper import WhisperModel
+import asyncio
+import base64
+import io
 import json
 import logging
-import asyncio
-import tempfile
-import base64
-import time
+import os
 import re
+import tempfile
+from contextlib import asynccontextmanager
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import httpx
+import numpy as np
+import soundfile as sf
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from faster_whisper import WhisperModel
+from kokoro import KPipeline
+from pydantic import BaseModel, Field
 
-# Load environment variables
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+)
+log = logging.getLogger("cleanTTS")
+
 load_dotenv()
 
-LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
-VOXTRAL_TTS_BASE_URL = os.getenv("VOXTRAL_TTS_BASE_URL", "http://localhost:8000/v1")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")  # fallback only
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "af_bella")
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are a helpful, concise voice assistant. Keep responses short and natural for speech.",
+)
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "5000"))
 
-# Initialize FastAPI
-app = FastAPI(title="Local Voice Assistant")
+KOKORO_SAMPLE_RATE = 24000
 
-# Mount static files and templates
-if not os.path.exists("static"):
-    os.makedirs("static")
+
+def _parse_backends() -> list[dict]:
+    raw = os.getenv("LLM_BACKENDS", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            out = []
+            for item in data:
+                if isinstance(item, dict) and item.get("name") and item.get("url"):
+                    out.append({"name": str(item["name"]), "url": str(item["url"]).rstrip("/")})
+            if out:
+                return out
+        except json.JSONDecodeError as e:
+            log.warning("LLM_BACKENDS JSON could not be parsed: %s", e)
+    return [{"name": "default", "url": LLM_BASE_URL.rstrip("/")}]
+
+
+LLM_BACKENDS = _parse_backends()
+
+
+def _find_backend(name: str | None) -> dict:
+    if name:
+        for b in LLM_BACKENDS:
+            if b["name"] == name:
+                return b
+    return LLM_BACKENDS[0]
+
+# Curated set of well-known Kokoro voices. Users can pass any voice id Kokoro
+# supports; this list is just for the UI dropdown and /v1/voices discovery.
+KOKORO_VOICES_BY_LANG = {
+    "a": [
+        "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
+        "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+        "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+        "am_michael", "am_onyx", "am_puck", "am_santa",
+    ],
+    "b": [
+        "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+        "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+    ],
+}
+
+state: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Loading Whisper: %s on %s", WHISPER_MODEL, WHISPER_DEVICE)
+    compute_type = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+    state["whisper"] = WhisperModel(
+        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute_type
+    )
+    log.info("Whisper loaded.")
+
+    log.info("Loading Kokoro: lang=%s", KOKORO_LANG)
+    state["kokoro"] = KPipeline(lang_code=KOKORO_LANG)
+    log.info("Kokoro loaded.")
+
+    yield
+
+    state.clear()
+
+
+app = FastAPI(title="cleanTTS", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# Initialize Whisper Model
-try:
-    logger.info(f"Loading Whisper Model: {WHISPER_MODEL} on {WHISPER_DEVICE}")
-    compute_type = "float16" if WHISPER_DEVICE == "cuda" else "int8"
-    whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute_type)
-    logger.info("Whisper Model loaded.")
-except Exception as e:
-    logger.error(f"CRITICAL: Failed to load Whisper on {WHISPER_DEVICE}. Error: {e}")
-    # Don't fall back to CPU silently, let the user know there's a driver/library issue
-    raise e
 
+def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
+    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz)."""
+    pipeline: KPipeline = state["kokoro"]
+    chunks = []
+    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        if hasattr(audio, "cpu"):
+            audio = audio.cpu().numpy()
+        elif hasattr(audio, "numpy"):
+            audio = audio.numpy()
+        chunks.append(np.asarray(audio, dtype=np.float32))
+    if not chunks:
+        return b""
+    wav = np.concatenate(chunks)
+    buf = io.BytesIO()
+    sf.write(buf, wav, samplerate=KOKORO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible TTS API (for external tools, e.g. the GT race app)
+# ---------------------------------------------------------------------------
+
+class SpeechRequest(BaseModel):
+    input: str = Field(..., description="Text to synthesize.")
+    model: str = Field("kokoro", description="Ignored; we always use Kokoro-82M.")
+    voice: str = Field(DEFAULT_VOICE, description="Voice id, e.g. af_bella.")
+    response_format: str = Field("wav", description="Only 'wav' is supported.")
+    speed: float = Field(1.0, ge=0.25, le=4.0)
+
+
+@app.post("/v1/audio/speech")
+async def speech(req: SpeechRequest):
+    if req.response_format.lower() != "wav":
+        raise HTTPException(400, f"response_format '{req.response_format}' not supported. Use 'wav'.")
+    if not req.input.strip():
+        raise HTTPException(400, "input must not be empty.")
+    try:
+        wav_bytes = await asyncio.to_thread(synthesize, req.input, req.voice, req.speed)
+    except Exception as e:
+        log.exception("TTS synthesis failed")
+        raise HTTPException(500, f"TTS failed: {e}")
+    if not wav_bytes:
+        raise HTTPException(500, "TTS produced no audio (Kokoro returned no chunks).")
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [{"id": "kokoro", "object": "model", "owned_by": "hexgrad"}],
+    }
+
+
+@app.get("/v1/voices")
+async def list_voices():
+    voices = KOKORO_VOICES_BY_LANG.get(KOKORO_LANG, [])
+    return {"voices": voices, "default": DEFAULT_VOICE, "lang": KOKORO_LANG}
+
+
+# ---------------------------------------------------------------------------
+# Voice assistant: UI + WebSocket pipeline
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def get_index(request: Request):
+async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
 
-@app.get("/api/models")
-async def get_models():
-    """Fetch available models from LM Studio."""
+
+@app.get("/api/llm-backends")
+async def llm_backends():
+    return {
+        "backends": [{"name": b["name"]} for b in LLM_BACKENDS],
+        "default": LLM_BACKENDS[0]["name"],
+    }
+
+
+@app.get("/api/llm-models")
+async def llm_models(backend: str | None = None):
+    b = _find_backend(backend)
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{LM_STUDIO_BASE_URL}/models")
-            response.raise_for_status()
-            data = response.json()
-            models = [model["id"] for model in data.get("data", [])]
-            return {"models": models}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{b['url']}/models")
+            r.raise_for_status()
+            data = r.json()
+            return {"models": [m["id"] for m in data.get("data", [])], "backend": b["name"]}
     except Exception as e:
-        logger.error(f"Error fetching models from LM Studio: {e}")
-        return {"models": [], "error": str(e)}
+        log.warning("LLM model list failed (%s): %s", b["name"], e)
+        return {"models": [], "backend": b["name"], "error": str(e)}
 
-@app.get("/api/tts-models")
-async def get_tts_models():
-    """Fetch available models from the TTS server."""
+
+SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(\s+|$)")
+
+
+def drain_sentences(buf: str) -> tuple[list[str], str]:
+    """Pull complete sentences from buf; return (sentences, leftover)."""
+    sentences: list[str] = []
+    while True:
+        m = SENTENCE_BOUNDARY.search(buf)
+        if not m:
+            break
+        end = m.end()
+        s = buf[:end].strip()
+        if s:
+            sentences.append(s)
+        buf = buf[end:]
+    return sentences, buf
+
+
+async def transcribe_bytes(audio_bytes: bytes) -> str:
+    """Write to a temp file (so ffmpeg can decode webm/ogg/etc) and run Whisper."""
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+        f.write(audio_bytes)
+        path = f.name
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{VOXTRAL_TTS_BASE_URL}/models")
-            response.raise_for_status()
-            data = response.json()
-            models = [model["id"] for model in data.get("data", [])]
-            return {"models": models}
-    except Exception as e:
-        logger.error(f"Error fetching models from TTS server: {e}")
-        return {"models": [], "error": str(e)}
+        whisper: WhisperModel = state["whisper"]
+        segments, _ = await asyncio.to_thread(
+            whisper.transcribe, path, beam_size=5
+        )
+        return "".join(s.text for s in segments).strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
-@app.get("/api/voices")
-async def get_voices():
-    """Return available preset voices for Qwen3 TTS by fetching from the server."""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{VOXTRAL_TTS_BASE_URL}/audio/voices")
-            if response.status_code == 200:
-                data = response.json()
-                return {"voices": data.get("voices", [])}
-    except Exception as e:
-        logger.error(f"Error fetching voices from TTS server: {e}")
-    
-    # Fallback to standard Qwen3 voices if server is unreachable
-    voices = [
-        "vivian", "serena", "isabella", "lily", "sohee",
-        "ryan", "aiden", "eric", "evan"
-    ]
-    return {"voices": voices}
-
-
-async def generate_tts(text: str, voice: str, model: str) -> bytes:
-    """Send text to vLLM-Omni TTS and return audio bytes."""
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            payload = {
-                "input": text,
-                "model": model,
-                "response_format": "wav",
-                "voice": voice,
-            }
-            logger.info(f"TTS Request Payload: {json.dumps(payload)}")
-            # Typically /v1/audio/speech for vllm-omni
-            response = await client.post(f"{VOXTRAL_TTS_BASE_URL}/audio/speech", json=payload)
-            
-            if response.status_code != 200:
-                logger.error(f"TTS Error {response.status_code}: {response.text}")
-                response.raise_for_status()
-                
-            return response.content
-    except Exception as e:
-        logger.error(f"Error calling TTS: {e}")
-        return None
-
-def is_sentence_end(text: str) -> bool:
-    """Simple check if the chunk ends a sentence."""
-    return bool(re.search(r'[.!?]\s*$', text))
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket connection accepted.")
+async def ws(socket: WebSocket):
+    await socket.accept()
+    log.info("WS connected")
+    history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Store chat history
-    messages = [{"role": "system", "content": "You are a helpful and concise voice assistant. Your responses should be short and natural for speech."}]
+    async def send(payload: dict):
+        await socket.send_text(json.dumps(payload))
 
     try:
         while True:
-            # Wait for data from client
-            data = await websocket.receive_text()
-            payload = json.loads(data)
+            raw = await socket.receive_text()
+            msg = json.loads(raw)
 
-            if "audio" in payload:
-                model_id = payload.get("model_id")
-                voice_id = payload.get("voice_id", "casual_female")
-                tts_model_id = payload.get("tts_model_id", "mistralai/Voxtral-4B-TTS-2603")
+            if msg.get("type") == "reset":
+                history = [{"role": "system", "content": SYSTEM_PROMPT}]
+                await send({"type": "reset_ack"})
+                continue
 
-                if not model_id:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "No model selected."}))
-                    continue
+            if "audio" not in msg:
+                continue
 
-                # 1. Transcribe Audio
-                audio_b64 = payload["audio"]
-                audio_bytes = base64.b64decode(audio_b64)
+            voice = msg.get("voice") or DEFAULT_VOICE
+            llm_model = msg.get("llm_model")
+            backend = _find_backend(msg.get("llm_backend"))
+            if not llm_model:
+                await send({"type": "error", "message": "Pick an LLM model first."})
+                continue
 
-                # Write to temp file for Whisper
-                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-                    tmp.write(audio_bytes)
-                    tmp_path = tmp.name
+            # 1. STT
+            try:
+                audio_bytes = base64.b64decode(msg["audio"])
+                transcription = await transcribe_bytes(audio_bytes)
+            except Exception as e:
+                log.exception("Whisper failed")
+                await send({"type": "error", "message": f"Whisper failed: {e}"})
+                continue
 
-                start_time = time.time()
-                segments, info = whisper_model.transcribe(tmp_path, beam_size=5)
-                transcription = "".join([segment.text for segment in segments]).strip()
-                os.unlink(tmp_path)
-                logger.info(f"Transcription took {time.time() - start_time:.2f}s: {transcription}")
+            if not transcription:
+                await send({"type": "transcription", "text": "(no speech detected)"})
+                continue
 
-                if not transcription:
-                    continue
+            await send({"type": "transcription", "text": transcription})
+            history.append({"role": "user", "content": transcription})
 
-                await websocket.send_text(json.dumps({
-                    "type": "transcription",
-                    "text": transcription
-                }))
+            # 2. LLM stream + sentence-chunked TTS
+            tts_q: asyncio.Queue = asyncio.Queue()
 
-                messages.append({"role": "user", "content": transcription})
+            async def tts_worker():
+                while True:
+                    sentence = await tts_q.get()
+                    if sentence is None:
+                        return
+                    try:
+                        wav = await asyncio.to_thread(synthesize, sentence, voice)
+                        if wav:
+                            await send({
+                                "type": "tts_audio",
+                                "audio": base64.b64encode(wav).decode("ascii"),
+                            })
+                    except Exception as e:
+                        log.exception("TTS chunk failed")
+                        await send({"type": "error", "message": f"TTS chunk failed: {e}"})
 
-                # 2. Get LLM response stream
-                try:
-                    async with httpx.AsyncClient(timeout=180.0) as client:
-                        llm_payload = {
-                            "model": model_id,
-                            "messages": messages,
-                            "stream": True,
-                            "temperature": 0.7,
-                            "max_tokens": 1024,
-                            "chat_template_kwargs": {
-                                "enable_thinking": False,
-                                "thinking": False
-                            }
-                        }
+            tts_task = asyncio.create_task(tts_worker())
 
-                        logger.info(f"LLM Payload: {json.dumps(llm_payload)}")
-                        logger.info(f"Sending request to LLM ({model_id})...")
+            full_response = ""
+            buf = ""
+            try:
+                async with httpx.AsyncClient(timeout=180.0) as client:
+                    payload = {
+                        "model": llm_model,
+                        "messages": history,
+                        "stream": True,
+                        "temperature": 0.7,
+                        "max_tokens": 1024,
+                    }
+                    async with client.stream(
+                        "POST", f"{backend['url']}/chat/completions", json=payload
+                    ) as r:
+                        r.raise_for_status()
+                        async for line in r.aiter_lines():
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(chunk)
+                            except json.JSONDecodeError:
+                                continue
+                            choices = obj.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
 
-                        full_response = ""
-                        current_chunk = ""
-                        
-                        tts_queue = asyncio.Queue()
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                            if reasoning:
+                                await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
 
-                        async def tts_worker():
-                            while True:
-                                text = await tts_queue.get()
-                                if text is None:  # Sentinel to stop worker
-                                    break
-                                logger.info(f"Worker Triggering TTS for: {text}")
-                                audio_content = await generate_tts(text, voice_id, tts_model_id)
-                                if audio_content:
-                                    try:
-                                        await websocket.send_text(json.dumps({
-                                            "type": "tts_audio",
-                                            "audio": base64.b64encode(audio_content).decode("utf-8")
-                                        }))
-                                    except Exception as e:
-                                        logger.error(f"Error sending TTS over websocket: {e}")
-                                tts_queue.task_done()
-                        
-                        tts_task = asyncio.create_task(tts_worker())
+                            text_piece = delta.get("content") or ""
+                            if not text_piece:
+                                continue
 
-                        async with client.stream("POST", f"{LM_STUDIO_BASE_URL}/chat/completions", json=llm_payload) as response:
-                            response.raise_for_status()
+                            full_response += text_piece
+                            buf += text_piece
+                            await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
 
-                            async for line in response.aiter_lines():
-                                line = line.strip()
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                
-                                line_data = line[5:].strip()
-                                if line_data == "[DONE]":
-                                    break
-                                try:
-                                    chunk_json = json.loads(line_data)
-                                    choices = chunk_json.get("choices", [])
-                                    
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        
-                                        # Support for reasoning/thinking tokens
-                                        reasoning_chunk = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                                        text_chunk = delta.get("content", "")
-                                        
-                                        if reasoning_chunk:
-                                            # Send reasoning to UI but NOT to TTS
-                                            await websocket.send_text(json.dumps({
-                                                "type": "llm_chunk",
-                                                "text": reasoning_chunk,
-                                                "is_reasoning": True
-                                            }))
-                                            continue
+                            sentences, buf = drain_sentences(buf)
+                            for s in sentences:
+                                await tts_q.put(s)
 
-                                        if text_chunk:
-                                            full_response += text_chunk
-                                            current_chunk += text_chunk
+                if buf.strip():
+                    await tts_q.put(buf.strip())
+            except Exception as e:
+                log.exception("LLM call failed")
+                await send({"type": "error", "message": f"LLM call failed: {e}"})
 
-                                            # Send text stream to frontend
-                                            await websocket.send_text(json.dumps({
-                                                "type": "llm_chunk",
-                                                "text": text_chunk,
-                                                "is_reasoning": False
-                                            }))
+            await tts_q.put(None)
+            await tts_task
 
-                                            # If chunk ends with sentence punctuation, enqueue TTS
-                                            if is_sentence_end(current_chunk):
-                                                tts_text = current_chunk.strip()
-                                                if tts_text:
-                                                    await tts_queue.put(tts_text)
-                                                current_chunk = ""
-                                except Exception as e:
-                                    logger.error(f"Error processing LLM chunk: {e}")
-                            
-                            # Handle any remaining text that didn't end with punctuation
-                            tts_text = current_chunk.strip()
-                            if tts_text:
-                                await tts_queue.put(tts_text)
-                                
-                            logger.info(f"Full response from LLM: {full_response}")
-                            
-                            # Stop the worker and wait for it to finish processing
-                            await tts_queue.put(None)
-                            await tts_task
-
-                        if not full_response:
-                            logger.warning("LLM returned an empty response.")
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": "The LLM returned an empty response. Check if the model is loaded correctly on the remote machine."
-                            }))
-                        else:
-                            messages.append({"role": "assistant", "content": full_response})
-
-                        # Tell frontend we are done
-                        await websocket.send_text(json.dumps({
-                            "type": "llm_done"
-                        }))
-
-                except Exception as e:
-                    logger.error(f"Error calling LLM: {e}")
-                    # Clear history on error to prevent corrupted sessions
-                    messages = [{"role": "system", "content": "You are a helpful and concise voice assistant. Your responses should be short and natural for speech."}]
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": f"Error communicating with the LLM: {str(e)}"
-                    }))
+            if full_response:
+                history.append({"role": "assistant", "content": full_response})
+            await send({"type": "llm_done"})
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected.")
-    except Exception as e:
-        logger.error(f"Unexpected error in websocket: {e}")
+        log.info("WS disconnected")
+    except Exception:
+        log.exception("WS handler error")
+        try:
+            await socket.send_text(json.dumps({"type": "error", "message": "Server error; see logs."}))
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host=HOST, port=PORT, log_level="info")
