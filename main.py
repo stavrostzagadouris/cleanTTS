@@ -31,7 +31,18 @@ load_dotenv()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")  # fallback only
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
-KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
+
+
+def _parse_langs() -> list[str]:
+    """KOKORO_LANGS=a,b loads multiple pipelines (one per language). Falls back
+    to KOKORO_LANG (singular) for backward compat."""
+    plural = os.getenv("KOKORO_LANGS", "").strip()
+    if plural:
+        return [c.strip() for c in plural.split(",") if c.strip()]
+    return [os.getenv("KOKORO_LANG", "a").strip()]
+
+
+KOKORO_LANGS = _parse_langs()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "af_bella")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
@@ -79,19 +90,28 @@ def _find_backend(name: str | None) -> dict:
                 return b
     return LLM_BACKENDS[0]
 
-# Curated set of well-known Kokoro voices. Users can pass any voice id Kokoro
-# supports; this list is just for the UI dropdown and /v1/voices discovery.
+# Full Kokoro v1 voice catalog, keyed by lang_code. Source: hexgrad/Kokoro-82M.
+# Only the entries listed in KOKORO_LANGS get loaded into VRAM at startup.
 KOKORO_VOICES_BY_LANG = {
-    "a": [
+    "a": [  # American English
         "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
         "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
         "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
         "am_michael", "am_onyx", "am_puck", "am_santa",
     ],
-    "b": [
+    "b": [  # British English
         "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
         "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
     ],
+    "e": ["ef_dora", "em_alex", "em_santa"],                   # Spanish
+    "f": ["ff_siwis"],                                          # French
+    "h": ["hf_alpha", "hf_beta", "hm_omega", "hm_psi"],         # Hindi
+    "i": ["if_sara", "im_nicola"],                              # Italian
+    "j": ["jf_alpha", "jf_gongitsune", "jf_nezumi",
+          "jf_tebukuro", "jm_kumo"],                            # Japanese
+    "p": ["pf_dora", "pm_alex", "pm_santa"],                    # Brazilian Portuguese
+    "z": ["zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+          "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang"], # Mandarin
 }
 
 state: dict = {}
@@ -106,9 +126,11 @@ async def lifespan(app: FastAPI):
     )
     log.info("Whisper loaded.")
 
-    log.info("Loading Kokoro: lang=%s", KOKORO_LANG)
-    state["kokoro"] = KPipeline(lang_code=KOKORO_LANG)
-    log.info("Kokoro loaded.")
+    log.info("Loading Kokoro pipelines: langs=%s", KOKORO_LANGS)
+    state["kokoro"] = {}
+    for lang in KOKORO_LANGS:
+        state["kokoro"][lang] = KPipeline(lang_code=lang)
+    log.info("Kokoro loaded: %d pipeline(s) — %s.", len(state["kokoro"]), ",".join(KOKORO_LANGS))
 
     yield
 
@@ -121,8 +143,16 @@ templates = Jinja2Templates(directory="templates")
 
 
 def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
-    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz)."""
-    pipeline: KPipeline = state["kokoro"]
+    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz). Picks the right
+    pipeline based on the voice's lang_code prefix (e.g. 'bf_emma' → 'b')."""
+    pipelines: dict[str, KPipeline] = state["kokoro"]
+    lang = voice[0] if voice else KOKORO_LANGS[0]
+    pipeline = pipelines.get(lang)
+    if pipeline is None:
+        raise ValueError(
+            f"Voice {voice!r} requires KOKORO_LANGS to include {lang!r}; "
+            f"loaded: {sorted(pipelines.keys())}"
+        )
     chunks = []
     for _, _, audio in pipeline(text, voice=voice, speed=speed):
         if hasattr(audio, "cpu"):
@@ -158,6 +188,8 @@ async def speech(req: SpeechRequest):
         raise HTTPException(400, "input must not be empty.")
     try:
         wav_bytes = await asyncio.to_thread(synthesize, req.input, req.voice, req.speed)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         log.exception("TTS synthesis failed")
         raise HTTPException(500, f"TTS failed: {e}")
@@ -176,8 +208,10 @@ async def list_models():
 
 @app.get("/v1/voices")
 async def list_voices():
-    voices = KOKORO_VOICES_BY_LANG.get(KOKORO_LANG, [])
-    return {"voices": voices, "default": DEFAULT_VOICE, "lang": KOKORO_LANG}
+    voices: list[str] = []
+    for lang in KOKORO_LANGS:
+        voices.extend(KOKORO_VOICES_BY_LANG.get(lang, []))
+    return {"voices": voices, "default": DEFAULT_VOICE, "langs": KOKORO_LANGS}
 
 
 # ---------------------------------------------------------------------------

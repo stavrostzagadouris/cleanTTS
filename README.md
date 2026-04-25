@@ -159,10 +159,31 @@ If you find the assistant interrupts itself:
 
 ## Calling the TTS API from your own tools
 
-Any OpenAI TTS client works. Plain `httpx`:
+The endpoint is OpenAI-compatible: `POST /v1/audio/speech` with JSON
+`{input, voice, speed}` returns WAV bytes. From any peer on your network
+or Tailscale, swap `localhost` for the host's IP (port `5000`).
+
+### Python — minimal (just `httpx` and the stdlib)
 
 ```python
-import httpx, sounddevice as sd, soundfile as sf, io
+import httpx
+
+r = httpx.post("http://localhost:5000/v1/audio/speech", json={
+    "input": "Hello from cleanTTS.",
+    "voice": "af_bella",
+})
+r.raise_for_status()
+with open("out.wav", "wb") as f:
+    f.write(r.content)
+```
+
+That's it — `out.wav` is a standard 24 kHz mono PCM WAV file. Open it in
+any audio player, drop it into Discord, attach it to an email, etc.
+
+### Python — speak it immediately (`sounddevice` + `soundfile`)
+
+```python
+import io, httpx, sounddevice as sd, soundfile as sf
 
 r = httpx.post("http://localhost:5000/v1/audio/speech", json={
     "input": "Third place, two seconds behind the leader.",
@@ -174,17 +195,18 @@ audio, sr = sf.read(io.BytesIO(r.content))
 sd.play(audio, sr); sd.wait()
 ```
 
-Or the OpenAI SDK:
+### Python — drop-in OpenAI SDK
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:5000/v1", api_key="not-needed")
-audio = client.audio.speech.create(model="kokoro", voice="af_bella",
-                                   input="P1, you've got the lead!")
-audio.stream_to_file("out.wav")
+
+client = OpenAI(base_url="http://localhost:5000/v1", api_key="unused")
+client.audio.speech.create(
+    model="kokoro", voice="af_bella", input="P1, you've got the lead!"
+).stream_to_file("out.wav")
 ```
 
-Or `curl`:
+### curl
 
 ```bash
 curl -X POST http://localhost:5000/v1/audio/speech \
@@ -193,18 +215,37 @@ curl -X POST http://localhost:5000/v1/audio/speech \
   --output hello.wav
 ```
 
+### Discoverability
+
+- `GET /v1/voices` — voices currently loaded on the server (depends on
+  `KOKORO_LANGS`)
+- `GET /v1/models` — OpenAI-compat model list (always returns `kokoro`)
+
 ---
 
 ## Voices
 
-US English (`KOKORO_LANG=a`):
-`af_alloy af_aoede af_bella af_heart af_jessica af_kore af_nicole af_nova af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck am_santa`
+Set `KOKORO_LANGS` to a comma-separated list of language codes; cleanTTS
+loads one `KPipeline` per language and routes synthesis by the voice's
+prefix letter. Default is `a,b` (US + UK English).
 
-UK English (`KOKORO_LANG=b`):
-`bf_alice bf_emma bf_isabella bf_lily bm_daniel bm_fable bm_george bm_lewis`
+| code | language | voices | count |
+|---|---|---|---|
+| `a` | American English | `af_alloy af_aoede af_bella af_heart af_jessica af_kore af_nicole af_nova af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir am_liam am_michael am_onyx am_puck am_santa` | 20 |
+| `b` | British English | `bf_alice bf_emma bf_isabella bf_lily bm_daniel bm_fable bm_george bm_lewis` | 8 |
+| `e` | Spanish | `ef_dora em_alex em_santa` | 3 |
+| `f` | French | `ff_siwis` | 1 |
+| `h` | Hindi | `hf_alpha hf_beta hm_omega hm_psi` | 4 |
+| `i` | Italian | `if_sara im_nicola` | 2 |
+| `j` | Japanese | `jf_alpha jf_gongitsune jf_nezumi jf_tebukuro jm_kumo` | 5 |
+| `p` | Brazilian Portuguese | `pf_dora pm_alex pm_santa` | 3 |
+| `z` | Mandarin | `zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi zm_yunjian zm_yunxi zm_yunxia zm_yunyang` | 8 |
 
-Other Kokoro languages (`j`, `z`, `e`, `f`, `h`, `i`, `p`) work too — set
-`KOKORO_LANG` and pass any voice id Kokoro supports for that language.
+Each loaded pipeline costs ~300 MB VRAM. Asking for a voice whose
+language isn't loaded returns `400` with a message telling you which
+code to add to `KOKORO_LANGS`.
+
+Note: Kokoro v1 has no Australian English. British is the closest fit.
 
 ---
 
