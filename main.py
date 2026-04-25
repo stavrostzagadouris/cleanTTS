@@ -237,11 +237,160 @@ async def transcribe_bytes(audio_bytes: bytes) -> str:
             pass
 
 
+async def run_pipeline(msg: dict, history: list[dict], send) -> None:
+    """One full STT → LLM → TTS turn. Cancellable: on CancelledError we save
+    whatever assistant text we already streamed to history, then re-raise."""
+    voice = msg.get("voice") or DEFAULT_VOICE
+    llm_model = msg.get("llm_model")
+    backend = _find_backend(msg.get("llm_backend"))
+
+    if not llm_model:
+        await send({"type": "error", "message": "Pick an LLM model first."})
+        return
+
+    # 1. STT
+    try:
+        audio_bytes = base64.b64decode(msg["audio"])
+        transcription = await transcribe_bytes(audio_bytes)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.exception("Whisper failed")
+        await send({"type": "error", "message": f"Whisper failed: {e}"})
+        return
+
+    if not transcription:
+        await send({"type": "transcription", "text": "(no speech detected)"})
+        await send({"type": "llm_done"})
+        return
+
+    await send({"type": "transcription", "text": transcription})
+    history.append({"role": "user", "content": transcription})
+
+    # 2. LLM stream + sentence-chunked TTS
+    tts_q: asyncio.Queue = asyncio.Queue()
+    full_response = ""
+
+    async def tts_worker():
+        while True:
+            sentence = await tts_q.get()
+            if sentence is None:
+                return
+            try:
+                wav = await asyncio.to_thread(synthesize, sentence, voice)
+                if wav:
+                    await send({
+                        "type": "tts_audio",
+                        "audio": base64.b64encode(wav).decode("ascii"),
+                    })
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.exception("TTS chunk failed")
+                await send({"type": "error", "message": f"TTS chunk failed: {e}"})
+
+    tts_task = asyncio.create_task(tts_worker())
+    cancelled = False
+
+    try:
+        buf = ""
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            payload = {
+                "model": llm_model,
+                "messages": history,
+                "stream": True,
+                "temperature": 0.7,
+                "max_tokens": 1024,
+            }
+            async with client.stream(
+                "POST", f"{backend['url']}/chat/completions", json=payload
+            ) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if reasoning:
+                        await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
+
+                    text_piece = delta.get("content") or ""
+                    if not text_piece:
+                        continue
+
+                    full_response += text_piece
+                    buf += text_piece
+                    await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
+
+                    sentences, buf = drain_sentences(buf)
+                    for s in sentences:
+                        await tts_q.put(s)
+
+        if buf.strip():
+            await tts_q.put(buf.strip())
+    except asyncio.CancelledError:
+        cancelled = True
+        log.info("Pipeline cancelled (barge-in or new turn)")
+        raise
+    except Exception as e:
+        log.exception("LLM call failed")
+        try:
+            await send({"type": "error", "message": f"LLM call failed: {e}"})
+        except Exception:
+            pass
+    finally:
+        # Always shut down the TTS worker so we don't leak tasks
+        await tts_q.put(None)
+        try:
+            await asyncio.wait_for(asyncio.shield(tts_task), timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            tts_task.cancel()
+
+        # Save whatever assistant text we generated (full or partial) so the
+        # LLM remembers what it had said before being interrupted.
+        if full_response.strip():
+            history.append({"role": "assistant", "content": full_response.strip()})
+
+        if cancelled:
+            try:
+                await send({"type": "cancelled"})
+            except Exception:
+                pass
+        else:
+            try:
+                await send({"type": "llm_done"})
+            except Exception:
+                pass
+
+
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 @app.websocket("/ws")
 async def ws(socket: WebSocket):
     await socket.accept()
     log.info("WS connected")
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    pipeline_task: asyncio.Task | None = None
 
     async def send(payload: dict):
         await socket.send_text(json.dumps(payload))
@@ -249,119 +398,29 @@ async def ws(socket: WebSocket):
     try:
         while True:
             raw = await socket.receive_text()
-            msg = json.loads(raw)
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
-            if msg.get("type") == "reset":
+            mtype = msg.get("type")
+
+            if mtype == "reset":
+                await _cancel_and_wait(pipeline_task)
                 history = [{"role": "system", "content": SYSTEM_PROMPT}]
                 await send({"type": "reset_ack"})
+                continue
+
+            if mtype == "cancel":
+                await _cancel_and_wait(pipeline_task)
                 continue
 
             if "audio" not in msg:
                 continue
 
-            voice = msg.get("voice") or DEFAULT_VOICE
-            llm_model = msg.get("llm_model")
-            backend = _find_backend(msg.get("llm_backend"))
-            if not llm_model:
-                await send({"type": "error", "message": "Pick an LLM model first."})
-                continue
-
-            # 1. STT
-            try:
-                audio_bytes = base64.b64decode(msg["audio"])
-                transcription = await transcribe_bytes(audio_bytes)
-            except Exception as e:
-                log.exception("Whisper failed")
-                await send({"type": "error", "message": f"Whisper failed: {e}"})
-                continue
-
-            if not transcription:
-                await send({"type": "transcription", "text": "(no speech detected)"})
-                continue
-
-            await send({"type": "transcription", "text": transcription})
-            history.append({"role": "user", "content": transcription})
-
-            # 2. LLM stream + sentence-chunked TTS
-            tts_q: asyncio.Queue = asyncio.Queue()
-
-            async def tts_worker():
-                while True:
-                    sentence = await tts_q.get()
-                    if sentence is None:
-                        return
-                    try:
-                        wav = await asyncio.to_thread(synthesize, sentence, voice)
-                        if wav:
-                            await send({
-                                "type": "tts_audio",
-                                "audio": base64.b64encode(wav).decode("ascii"),
-                            })
-                    except Exception as e:
-                        log.exception("TTS chunk failed")
-                        await send({"type": "error", "message": f"TTS chunk failed: {e}"})
-
-            tts_task = asyncio.create_task(tts_worker())
-
-            full_response = ""
-            buf = ""
-            try:
-                async with httpx.AsyncClient(timeout=180.0) as client:
-                    payload = {
-                        "model": llm_model,
-                        "messages": history,
-                        "stream": True,
-                        "temperature": 0.7,
-                        "max_tokens": 1024,
-                    }
-                    async with client.stream(
-                        "POST", f"{backend['url']}/chat/completions", json=payload
-                    ) as r:
-                        r.raise_for_status()
-                        async for line in r.aiter_lines():
-                            line = line.strip()
-                            if not line.startswith("data:"):
-                                continue
-                            chunk = line[5:].strip()
-                            if chunk == "[DONE]":
-                                break
-                            try:
-                                obj = json.loads(chunk)
-                            except json.JSONDecodeError:
-                                continue
-                            choices = obj.get("choices") or []
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta") or {}
-
-                            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                            if reasoning:
-                                await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
-
-                            text_piece = delta.get("content") or ""
-                            if not text_piece:
-                                continue
-
-                            full_response += text_piece
-                            buf += text_piece
-                            await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
-
-                            sentences, buf = drain_sentences(buf)
-                            for s in sentences:
-                                await tts_q.put(s)
-
-                if buf.strip():
-                    await tts_q.put(buf.strip())
-            except Exception as e:
-                log.exception("LLM call failed")
-                await send({"type": "error", "message": f"LLM call failed: {e}"})
-
-            await tts_q.put(None)
-            await tts_task
-
-            if full_response:
-                history.append({"role": "assistant", "content": full_response})
-            await send({"type": "llm_done"})
+            # New turn: cancel any in-flight pipeline (barge-in or just sequential turns).
+            await _cancel_and_wait(pipeline_task)
+            pipeline_task = asyncio.create_task(run_pipeline(msg, history, send))
 
     except WebSocketDisconnect:
         log.info("WS disconnected")
@@ -371,6 +430,8 @@ async def ws(socket: WebSocket):
             await socket.send_text(json.dumps({"type": "error", "message": "Server error; see logs."}))
         except Exception:
             pass
+    finally:
+        await _cancel_and_wait(pipeline_task)
 
 
 if __name__ == "__main__":

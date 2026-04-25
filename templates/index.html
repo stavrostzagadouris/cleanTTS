@@ -14,6 +14,7 @@
       --accent: #5ea1ff;
       --accent-strong: #2f7bff;
       --danger: #e0485f;
+      --warn: #f0a020;
       --user: #2f7bff;
       --assistant: #2a2f3a;
       --ok: #4ec9b0;
@@ -70,6 +71,7 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
     button.danger { background: var(--danger); }
+    button.danger:hover:not(:disabled) { background: #f25d72; }
 
     .chat {
       height: 320px;
@@ -95,18 +97,33 @@
     .msg.assistant { background: var(--assistant); align-self: flex-start; border-bottom-left-radius: 4px; }
     .reasoning { color: var(--muted); font-style: italic; font-size: 12px; display: block; margin-bottom: 6px; }
 
-    .mic-row { display: flex; align-items: center; gap: 12px; }
-    .mic {
-      width: 64px; height: 64px; border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 26px; background: var(--danger); flex-shrink: 0;
+    .conv-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+    .conv-btn {
+      width: auto;
+      padding: 12px 22px;
+      font-size: 15px;
+      font-weight: 500;
+      flex-shrink: 0;
+      min-width: 180px;
     }
-    .mic.recording { animation: pulse 1.4s infinite; }
-    @keyframes pulse {
-      0% { box-shadow: 0 0 0 0 rgba(224, 72, 95, 0.7); }
-      70% { box-shadow: 0 0 0 18px rgba(224, 72, 95, 0); }
-      100% { box-shadow: 0 0 0 0 rgba(224, 72, 95, 0); }
+
+    .status-wrap { display: flex; align-items: center; flex: 1; min-width: 0; }
+    .state-dot {
+      display: inline-block;
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--muted); margin-right: 8px;
+      flex-shrink: 0;
+      transition: background 0.2s;
     }
+    .state-dot.listening { background: var(--ok); animation: pulse-dot 1.4s infinite; }
+    .state-dot.processing { background: var(--warn); }
+    .state-dot.speaking { background: var(--accent); }
+    @keyframes pulse-dot {
+      0%   { box-shadow: 0 0 0 0   rgba(78, 201, 176, 0.6); }
+      70%  { box-shadow: 0 0 0 8px rgba(78, 201, 176, 0);   }
+      100% { box-shadow: 0 0 0 0   rgba(78, 201, 176, 0);   }
+    }
+
     .status { color: var(--muted); font-size: 13px; }
     .status.ok { color: var(--ok); }
     .status.err { color: var(--danger); }
@@ -145,10 +162,11 @@
 
       <div class="chat" id="chat"></div>
 
-      <div class="mic-row" style="margin-top: 12px;">
-        <button id="mic" class="mic" title="Hold or click to talk">🎤</button>
-        <div style="flex: 1;">
-          <div id="status" class="status">Ready. Click the mic to talk.</div>
+      <div class="conv-row">
+        <button id="conv" class="conv-btn" type="button">Start conversation</button>
+        <div class="status-wrap">
+          <span id="state-dot" class="state-dot"></span>
+          <span id="status" class="status">Click Start to begin.</span>
         </div>
         <button id="reset" class="ghost" style="width: auto;">New chat</button>
       </div>
@@ -175,35 +193,90 @@
     </section>
   </div>
 
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web/dist/bundle.min.js"></script>
 <script>
   const $ = (id) => document.getElementById(id);
   const chat = $('chat');
   const status = $('status');
+  const stateDot = $('state-dot');
   const llmBackend = $('llm-backend');
   const llmModel = $('llm-model');
   const voiceSel = $('voice');
   const testVoice = $('test-voice');
-  const micBtn = $('mic');
+  const convBtn = $('conv');
   const resetBtn = $('reset');
   const testBtn = $('test-speak');
   const testText = $('test-text');
   const testSpeed = $('test-speed');
   const testStatus = $('test-status');
 
+  // ---- state machine ----------------------------------------------------
+  const S = { IDLE: 'idle', LISTENING: 'listening', PROCESSING: 'processing', SPEAKING: 'speaking' };
+  let appState = S.IDLE;
+
+  // ---- VAD --------------------------------------------------------------
+  let myVAD = null;
+  let vadLoading = false;
+
+  // ---- audio playback ---------------------------------------------------
+  const audioQueue = [];
+  let currentAudio = null;
+  let isPlaying = false;
+  // Cooldown: ignore VAD speech-start for ~200ms after each TTS chunk begins,
+  // so the start of our own assistant's voice doesn't trip a barge-in via
+  // speaker bleed (browser AEC is the primary defense; this is belt+braces).
+  let bargeIneligibleUntil = 0;
+
+  // ---- LLM streaming flag ----------------------------------------------
+  let llmStreaming = false;
+
+  // ---- WebSocket --------------------------------------------------------
   let ws;
-  let mediaRecorder;
-  let audioChunks = [];
-  let recording = false;
   let currentAssistantMsg = null;
 
-  // Audio playback queue (so consecutive TTS chunks play in order)
-  const audioQueue = [];
-  let isPlaying = false;
+  // -----------------------------------------------------------------------
 
   function setStatus(text, kind = '') {
     status.textContent = text;
     status.className = 'status' + (kind ? ' ' + kind : '');
   }
+
+  function setState(next) {
+    appState = next;
+    stateDot.className = 'state-dot' + (next === S.IDLE ? '' : ' ' + next);
+    switch (next) {
+      case S.IDLE:
+        convBtn.textContent = 'Start conversation';
+        convBtn.classList.remove('danger');
+        setStatus('Click Start to begin.');
+        break;
+      case S.LISTENING:
+        convBtn.textContent = 'Stop conversation';
+        convBtn.classList.add('danger');
+        setStatus('Listening — go ahead and talk.', 'ok');
+        break;
+      case S.PROCESSING:
+        convBtn.textContent = 'Stop conversation';
+        convBtn.classList.add('danger');
+        setStatus('Thinking…');
+        break;
+      case S.SPEAKING:
+        convBtn.textContent = 'Stop conversation';
+        convBtn.classList.add('danger');
+        setStatus('Speaking — interrupt anytime.', 'ok');
+        break;
+    }
+  }
+
+  function maybeReturnToListening() {
+    if (appState === S.IDLE) return;
+    if (llmStreaming) return;
+    if (audioQueue.length || isPlaying) return;
+    if (appState !== S.LISTENING) setState(S.LISTENING);
+  }
+
+  // ---- selects + discovery ---------------------------------------------
 
   function fillSelect(sel, items, fallback) {
     sel.innerHTML = '';
@@ -241,10 +314,9 @@
       const r = await fetch(url);
       const data = await r.json();
       fillSelect(llmModel, data.models, []);
-      const tag = data.backend ? ` [${data.backend}]` : '';
-      if (data.error) setStatus(`LLM unreachable${tag}: ${data.error}`, 'err');
+      if (data.error) setStatus(`LLM unreachable [${data.backend}]: ${data.error}`, 'err');
       else if (!data.models || !data.models.length) setStatus(`No models on ${data.backend}.`, 'err');
-      else setStatus(`Ready. ${data.models.length} model(s) on ${data.backend}.`, 'ok');
+      else if (appState === S.IDLE) setStatus(`Ready. ${data.models.length} model(s) on ${data.backend}.`, 'ok');
     } catch (e) {
       fillSelect(llmModel, [], []);
       setStatus('Could not reach LLM: ' + e.message, 'err');
@@ -265,6 +337,8 @@
       console.error(e);
     }
   }
+
+  // ---- chat rendering --------------------------------------------------
 
   function addMsg(text, role) {
     const div = document.createElement('div');
@@ -295,21 +369,192 @@
     return span;
   }
 
+  // ---- audio playback --------------------------------------------------
+
   function playNext() {
     if (isPlaying || !audioQueue.length) return;
     isPlaying = true;
     const url = audioQueue.shift();
-    const a = new Audio(url);
-    a.onended = () => { isPlaying = false; playNext(); };
-    a.onerror = () => { isPlaying = false; playNext(); };
-    a.play().catch((e) => { console.error('play err', e); isPlaying = false; playNext(); });
+    currentAudio = new Audio(url);
+    bargeIneligibleUntil = Date.now() + 200;
+    currentAudio.onended = () => {
+      isPlaying = false;
+      currentAudio = null;
+      if (audioQueue.length) playNext();
+      else maybeReturnToListening();
+    };
+    currentAudio.onerror = () => {
+      isPlaying = false;
+      currentAudio = null;
+      playNext();
+    };
+    currentAudio.play().catch((e) => {
+      console.error('audio play err', e);
+      isPlaying = false;
+      currentAudio = null;
+      playNext();
+    });
   }
+
+  function stopAudioPlayback() {
+    if (currentAudio) {
+      try { currentAudio.pause(); } catch (e) { /* ignore */ }
+      currentAudio = null;
+    }
+    audioQueue.length = 0;
+    isPlaying = false;
+  }
+
+  // ---- WAV encoding ----------------------------------------------------
+
+  function float32ToWav(samples, sampleRate) {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buf);
+    const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);   // chunk size
+    view.setUint16(20, 1, true);    // PCM
+    view.setUint16(22, 1, true);    // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);  // byte rate
+    view.setUint16(32, 2, true);    // block align
+    view.setUint16(34, 16, true);   // bits/sample
+    writeStr(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    let off = 44;
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      off += 2;
+    }
+    return buf;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+    }
+    return btoa(binary);
+  }
+
+  // ---- VAD callbacks ---------------------------------------------------
+
+  function onVadSpeechStart() {
+    if (appState === S.SPEAKING) {
+      if (Date.now() < bargeIneligibleUntil) return;
+      // Barge in: stop the assistant immediately so we can hear ourselves think.
+      stopAudioPlayback();
+      llmStreaming = false;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'cancel' }));
+      }
+      setStatus('Listening (interrupting)…', 'ok');
+      stateDot.className = 'state-dot listening';
+    }
+  }
+
+  function onVadSpeechEnd(audioFloat32) {
+    if (appState === S.IDLE) return;
+    if (!llmModel.value) {
+      setStatus('Pick an LLM model first.', 'err');
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setStatus('Not connected. Reconnecting…', 'err');
+      return;
+    }
+    const wav = float32ToWav(audioFloat32, 16000);
+    const b64 = arrayBufferToBase64(wav);
+    ws.send(JSON.stringify({
+      audio: b64,
+      llm_backend: llmBackend.value,
+      llm_model: llmModel.value,
+      voice: voiceSel.value,
+    }));
+    setState(S.PROCESSING);
+  }
+
+  // ---- VAD init (lazy on first Start click) ----------------------------
+
+  async function initVAD() {
+    if (myVAD) return myVAD;
+    if (vadLoading) {
+      while (vadLoading) await new Promise((r) => setTimeout(r, 50));
+      return myVAD;
+    }
+    vadLoading = true;
+    try {
+      setStatus('Loading VAD model…');
+      myVAD = await vad.MicVAD.new({
+        baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web/dist/',
+        onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/',
+        additionalAudioConstraints: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        onSpeechStart: onVadSpeechStart,
+        onSpeechEnd: onVadSpeechEnd,
+      });
+    } finally {
+      vadLoading = false;
+    }
+    return myVAD;
+  }
+
+  // ---- conversation toggle ---------------------------------------------
+
+  async function toggleConversation() {
+    if (appState !== S.IDLE) {
+      // STOP
+      if (myVAD) myVAD.pause();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'cancel' }));
+      }
+      stopAudioPlayback();
+      llmStreaming = false;
+      setState(S.IDLE);
+      return;
+    }
+    // START
+    if (!llmModel.value) {
+      setStatus('Pick an LLM model first.', 'err');
+      return;
+    }
+    convBtn.disabled = true;
+    try {
+      await initVAD();
+      myVAD.start();
+      setState(S.LISTENING);
+    } catch (e) {
+      console.error('VAD init failed:', e);
+      setStatus('VAD failed to start: ' + (e.message || e) + ' (use http://localhost:5000)', 'err');
+    } finally {
+      convBtn.disabled = false;
+    }
+  }
+
+  // ---- WebSocket -------------------------------------------------------
 
   function setupWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
 
-    ws.onopen = () => setStatus('Ready. Click the mic to talk.', 'ok');
+    ws.onopen = () => {
+      // If we reconnected mid-conversation, reset to clean state.
+      if (appState !== S.IDLE) {
+        if (myVAD) myVAD.pause();
+        stopAudioPlayback();
+        llmStreaming = false;
+        setState(S.IDLE);
+      }
+    };
     ws.onclose = () => {
       setStatus('Disconnected. Reconnecting…', 'err');
       setTimeout(setupWS, 2000);
@@ -319,8 +564,10 @@
       switch (data.type) {
         case 'transcription':
           addMsg(data.text, 'user');
-          setStatus('Generating response…');
-          currentAssistantMsg = addMsg('', 'assistant');
+          if (data.text !== '(no speech detected)') {
+            currentAssistantMsg = addMsg('', 'assistant');
+            llmStreaming = true;
+          }
           break;
         case 'llm_chunk':
           if (!currentAssistantMsg) currentAssistantMsg = addMsg('', 'assistant');
@@ -333,64 +580,34 @@
           break;
         case 'tts_audio':
           audioQueue.push(`data:audio/wav;base64,${data.audio}`);
+          if (appState === S.PROCESSING) setState(S.SPEAKING);
           playNext();
           break;
         case 'llm_done':
-          setStatus('Done. Click the mic again.', 'ok');
+          llmStreaming = false;
+          currentAssistantMsg = null;
+          maybeReturnToListening();
+          break;
+        case 'cancelled':
+          // Server confirmed it killed the in-flight pipeline. The new
+          // user audio is already queued or will be sent shortly.
+          llmStreaming = false;
           currentAssistantMsg = null;
           break;
         case 'reset_ack':
           chat.innerHTML = '';
-          setStatus('Chat reset.', 'ok');
+          if (appState === S.IDLE) setStatus('Chat reset.', 'ok');
           break;
         case 'error':
           setStatus('Error: ' + data.message, 'err');
+          llmStreaming = false;
+          maybeReturnToListening();
           break;
       }
     };
   }
 
-  async function toggleRecording() {
-    if (!llmModel.value) {
-      setStatus('Pick an LLM model first.', 'err');
-      return;
-    }
-    if (recording) {
-      mediaRecorder.stop();
-      recording = false;
-      micBtn.classList.remove('recording');
-      setStatus('Transcribing…');
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder = new MediaRecorder(stream);
-      audioChunks = [];
-      mediaRecorder.ondataavailable = (ev) => audioChunks.push(ev.data);
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-        const fr = new FileReader();
-        fr.readAsDataURL(blob);
-        fr.onloadend = () => {
-          const b64 = fr.result.split(',')[1];
-          ws.send(JSON.stringify({
-            audio: b64,
-            llm_backend: llmBackend.value,
-            llm_model: llmModel.value,
-            voice: voiceSel.value,
-          }));
-        };
-        stream.getTracks().forEach((t) => t.stop());
-      };
-      mediaRecorder.start();
-      recording = true;
-      micBtn.classList.add('recording');
-      setStatus('Listening… click again to stop.');
-    } catch (e) {
-      setStatus('Mic error: ' + e.message + ' (use http://localhost:5000)', 'err');
-    }
-  }
+  // ---- TTS test panel (unchanged behavior) -----------------------------
 
   async function testTTS() {
     const text = testText.value.trim();
@@ -426,19 +643,28 @@
     }
   }
 
+  // ---- reset chat ------------------------------------------------------
+
   function reset() {
+    if (myVAD) myVAD.pause();
+    stopAudioPlayback();
+    llmStreaming = false;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'reset' }));
     } else {
       chat.innerHTML = '';
     }
+    setState(S.IDLE);
   }
 
-  micBtn.addEventListener('click', toggleRecording);
+  // ---- init ------------------------------------------------------------
+
+  convBtn.addEventListener('click', toggleConversation);
   resetBtn.addEventListener('click', reset);
   testBtn.addEventListener('click', testTTS);
   llmBackend.addEventListener('change', loadLLMModels);
 
+  setState(S.IDLE);
   loadBackends();
   loadVoices();
   setupWS();

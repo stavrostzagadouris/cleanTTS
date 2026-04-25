@@ -111,6 +111,36 @@ this — they don't need a mic, so the LAN/Tailscale IP works fine for them.
 
 ---
 
+## Conversation mode
+
+The mic button toggles **Start conversation / Stop conversation**. Once
+started, [Silero VAD](https://github.com/snakers4/silero-vad) (loaded
+in-browser via [`@ricky0123/vad-web`](https://github.com/ricky0123/vad))
+listens continuously: when you stop speaking it sends the utterance for
+processing, then resumes listening after the assistant replies.
+
+**Barge-in is supported.** While the assistant is speaking, you can just
+start talking — it cuts off mid-word, the server cancels the in-flight
+LLM/TTS pipeline, and the assistant remembers what it had said up to that
+point so the next turn picks up coherently.
+
+The first time you click *Start conversation*, the browser downloads the
+~1.5 MB Silero ONNX model (cached after that).
+
+### Echo / feedback loop
+
+Barge-in relies on the browser's built-in **acoustic echo cancellation**
+(AEC) so your speakers don't trigger the mic. Modern Chrome/Edge/Firefox
+do this by default for `getUserMedia`, and it works well in most setups.
+If you find the assistant interrupts itself:
+
+- **Easiest fix**: use headphones — physically removes the loop.
+- Lower your speaker volume so AEC has an easier time.
+- Some Linux audio stacks (PipeWire) need extra config; `echo-cancel` is
+  a separate module there.
+
+---
+
 ## Calling the TTS API from your own tools
 
 Any OpenAI TTS client works. Plain `httpx`:
