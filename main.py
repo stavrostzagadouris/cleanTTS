@@ -51,7 +51,17 @@ def _parse_backends() -> list[dict]:
             out = []
             for item in data:
                 if isinstance(item, dict) and item.get("name") and item.get("url"):
-                    out.append({"name": str(item["name"]), "url": str(item["url"]).rstrip("/")})
+                    backend = {
+                        "name": str(item["name"]),
+                        "url": str(item["url"]).rstrip("/"),
+                    }
+                    # Optional: chat_template_kwargs forwarded into each
+                    # /v1/chat/completions request for this backend. Use this to
+                    # disable thinking on Qwen3 ({"enable_thinking": false}), etc.
+                    ctk = item.get("chat_template_kwargs")
+                    if isinstance(ctk, dict):
+                        backend["chat_template_kwargs"] = ctk
+                    out.append(backend)
             if out:
                 return out
         except json.JSONDecodeError as e:
@@ -302,6 +312,8 @@ async def run_pipeline(msg: dict, history: list[dict], send) -> None:
                 "temperature": 0.7,
                 "max_tokens": 1024,
             }
+            if backend.get("chat_template_kwargs"):
+                payload["chat_template_kwargs"] = backend["chat_template_kwargs"]
             async with client.stream(
                 "POST", f"{backend['url']}/chat/completions", json=payload
             ) as r:

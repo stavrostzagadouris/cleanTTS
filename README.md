@@ -73,6 +73,22 @@ PORT=5000
 The UI shows a "LLM server" dropdown; switching it refetches that backend's
 model list. The first backend in the list is the default.
 
+### Disabling thinking on Qwen3 / reasoning models
+
+Reasoning models (Qwen3 etc.) are too slow for natural voice — by the time
+they finish thinking, the conversation has moved on. You can disable
+thinking **for this app only** by adding `chat_template_kwargs` to a
+backend entry:
+
+```json
+{"name":"5090","url":"http://...","chat_template_kwargs":{"enable_thinking":false}}
+```
+
+This kwarg is forwarded per-request, so other clients hitting the same
+vLLM/LM Studio endpoint still get thinking enabled. Works on any model
+whose chat template supports `enable_thinking` (Qwen3 family). Other
+models silently ignore unknown kwargs.
+
 ---
 
 ## Run
