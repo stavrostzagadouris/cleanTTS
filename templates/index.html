@@ -97,7 +97,7 @@
     .msg.assistant { background: var(--assistant); align-self: flex-start; border-bottom-left-radius: 4px; }
     .reasoning { color: var(--muted); font-style: italic; font-size: 12px; display: block; margin-bottom: 6px; }
 
-    .conv-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+    .conv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; }
     .conv-btn {
       width: auto;
       padding: 12px 22px;
@@ -106,6 +106,7 @@
       flex-shrink: 0;
       min-width: 180px;
     }
+    #ptt { min-width: 150px; }
 
     .status-wrap { display: flex; align-items: center; flex: 1; min-width: 0; }
     .state-dot {
@@ -164,6 +165,7 @@
 
       <div class="conv-row">
         <button id="conv" class="conv-btn" type="button">Start conversation</button>
+        <button id="ptt" class="conv-btn ghost" type="button">Push to talk</button>
         <div class="status-wrap">
           <span id="state-dot" class="state-dot"></span>
           <span id="status" class="status">Click Start to begin.</span>
@@ -205,6 +207,7 @@
   const voiceSel = $('voice');
   const testVoice = $('test-voice');
   const convBtn = $('conv');
+  const pttBtn = $('ptt');
   const resetBtn = $('reset');
   const testBtn = $('test-speak');
   const testText = $('test-text');
@@ -214,10 +217,23 @@
   // ---- state machine ----------------------------------------------------
   const S = { IDLE: 'idle', LISTENING: 'listening', PROCESSING: 'processing', SPEAKING: 'speaking' };
   let appState = S.IDLE;
+  // Top-level input mode: 'idle' = no mic, 'conv' = VAD conversation,
+  // 'ptt' = push-to-talk (mutually exclusive with conv).
+  let mode = 'idle';
 
   // ---- VAD --------------------------------------------------------------
   let myVAD = null;
   let vadLoading = false;
+  // Sustained-speech threshold before a real interrupt commits. Stops short
+  // noises (coughs, "uh huh", speaker bleed past AEC) from cutting off TTS.
+  const BARGE_IN_HOLD_MS = 1000;
+  let bargeInTimer = null;
+
+  // ---- PTT --------------------------------------------------------------
+  let pttRecorder = null;
+  let pttStream = null;
+  let pttChunks = [];
+  let pttRecording = false;
 
   // ---- audio playback ---------------------------------------------------
   const audioQueue = [];
@@ -273,7 +289,23 @@
     if (appState === S.IDLE) return;
     if (llmStreaming) return;
     if (audioQueue.length || isPlaying) return;
-    if (appState !== S.LISTENING) setState(S.LISTENING);
+    if (mode === 'conv') {
+      if (appState !== S.LISTENING) setState(S.LISTENING);
+    } else {
+      // PTT (or stale state): the turn is done, drop back to idle.
+      mode = 'idle';
+      setState(S.IDLE);
+      updateButtonStates();
+    }
+  }
+
+  function updateButtonStates() {
+    pttBtn.disabled = (mode === 'conv');
+    convBtn.disabled = (mode === 'ptt');
+  }
+
+  function clearBargeInTimer() {
+    if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null; }
   }
 
   // ---- selects + discovery ---------------------------------------------
@@ -446,21 +478,39 @@
   // ---- VAD callbacks ---------------------------------------------------
 
   function onVadSpeechStart() {
-    if (appState === S.SPEAKING) {
-      if (Date.now() < bargeIneligibleUntil) return;
-      // Barge in: stop the assistant immediately so we can hear ourselves think.
+    if (appState !== S.SPEAKING) return;
+    if (Date.now() < bargeIneligibleUntil) return;
+    // Don't cancel the assistant on the first frame of detected speech —
+    // that's how coughs and speaker bleed end up killing TTS. Wait for
+    // sustained speech to confirm it's a real interrupt.
+    clearBargeInTimer();
+    bargeInTimer = setTimeout(() => {
+      bargeInTimer = null;
+      if (appState !== S.SPEAKING) return;
       stopAudioPlayback();
       llmStreaming = false;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'cancel' }));
       }
+      setState(S.LISTENING);
       setStatus('Listening (interrupting)…', 'ok');
-      stateDot.className = 'state-dot listening';
-    }
+    }, BARGE_IN_HOLD_MS);
+  }
+
+  function onVadVADMisfire() {
+    // Short blip below minSpeechFrames — never a real utterance.
+    clearBargeInTimer();
   }
 
   function onVadSpeechEnd(audioFloat32) {
     if (appState === S.IDLE) return;
+    // Speech ended while assistant is still talking and the 1s confirmation
+    // hasn't fired — too short to be a real interrupt. Drop the audio.
+    if (appState === S.SPEAKING) {
+      clearBargeInTimer();
+      return;
+    }
+    clearBargeInTimer();
     if (!llmModel.value) {
       setStatus('Pick an LLM model first.', 'err');
       return;
@@ -499,8 +549,12 @@
           noiseSuppression: true,
           autoGainControl: true,
         },
+        // Frames are ~96ms each; 12 ≈ 1.15s. Anything shorter is treated as
+        // a misfire and never even reaches Whisper.
+        minSpeechFrames: 12,
         onSpeechStart: onVadSpeechStart,
         onSpeechEnd: onVadSpeechEnd,
+        onVADMisfire: onVadVADMisfire,
       });
     } finally {
       vadLoading = false;
@@ -511,7 +565,7 @@
   // ---- conversation toggle ---------------------------------------------
 
   async function toggleConversation() {
-    if (appState !== S.IDLE) {
+    if (mode === 'conv') {
       // STOP
       if (myVAD) myVAD.pause();
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -519,7 +573,14 @@
       }
       stopAudioPlayback();
       llmStreaming = false;
+      clearBargeInTimer();
+      mode = 'idle';
       setState(S.IDLE);
+      updateButtonStates();
+      return;
+    }
+    if (mode === 'ptt') {
+      setStatus('Stop push-to-talk first.', 'err');
       return;
     }
     // START
@@ -531,13 +592,106 @@
     try {
       await initVAD();
       myVAD.start();
+      mode = 'conv';
       setState(S.LISTENING);
+      updateButtonStates();
     } catch (e) {
       console.error('VAD init failed:', e);
       setStatus('VAD failed to start: ' + (e.message || e) + ' (use http://localhost:5000)', 'err');
-    } finally {
       convBtn.disabled = false;
     }
+  }
+
+  // ---- push-to-talk (toggle) -------------------------------------------
+
+  async function togglePTT() {
+    if (mode === 'conv') return;  // button is disabled in this mode
+    if (pttRecording) {
+      stopPTTRecording();
+      return;
+    }
+    if (!llmModel.value) {
+      setStatus('Pick an LLM model first.', 'err');
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setStatus('Not connected.', 'err');
+      return;
+    }
+    // If a previous PTT turn is still in flight, cancel it before recording.
+    if (appState !== S.IDLE) {
+      ws.send(JSON.stringify({ type: 'cancel' }));
+      stopAudioPlayback();
+      llmStreaming = false;
+    }
+    try {
+      await startPTTRecording();
+    } catch (e) {
+      console.error('PTT start failed:', e);
+      setStatus('Mic access failed: ' + (e.message || e), 'err');
+    }
+  }
+
+  async function startPTTRecording() {
+    pttStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    pttChunks = [];
+    pttRecorder = new MediaRecorder(pttStream);
+    pttRecorder.ondataavailable = (e) => { if (e.data && e.data.size) pttChunks.push(e.data); };
+    pttRecorder.onstop = onPTTRecorderStop;
+    pttRecorder.start();
+    pttRecording = true;
+    mode = 'ptt';
+    pttBtn.textContent = 'Stop & send';
+    pttBtn.classList.remove('ghost');
+    pttBtn.classList.add('danger');
+    setStatus('Recording — click to send.', 'ok');
+    stateDot.className = 'state-dot listening';
+    updateButtonStates();
+  }
+
+  function stopPTTRecording() {
+    if (pttRecorder && pttRecorder.state === 'recording') {
+      pttRecorder.stop();  // fires onstop → onPTTRecorderStop
+    }
+    pttRecording = false;
+    pttBtn.textContent = 'Push to talk';
+    pttBtn.classList.add('ghost');
+    pttBtn.classList.remove('danger');
+  }
+
+  function onPTTRecorderStop() {
+    const type = (pttChunks[0] && pttChunks[0].type) || 'audio/webm';
+    const blob = new Blob(pttChunks, { type });
+    if (pttStream) {
+      pttStream.getTracks().forEach((t) => t.stop());
+      pttStream = null;
+    }
+    if (!blob.size) {
+      setStatus('No audio captured.', 'err');
+      mode = 'idle';
+      setState(S.IDLE);
+      updateButtonStates();
+      return;
+    }
+    blob.arrayBuffer().then((buf) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setStatus('Not connected — recording dropped.', 'err');
+        mode = 'idle';
+        setState(S.IDLE);
+        updateButtonStates();
+        return;
+      }
+      const b64 = arrayBufferToBase64(buf);
+      ws.send(JSON.stringify({
+        audio: b64,
+        llm_backend: llmBackend.value,
+        llm_model: llmModel.value,
+        voice: voiceSel.value,
+      }));
+      setState(S.PROCESSING);
+    });
   }
 
   // ---- WebSocket -------------------------------------------------------
@@ -547,12 +701,26 @@
     ws = new WebSocket(`${proto}//${location.host}/ws`);
 
     ws.onopen = () => {
-      // If we reconnected mid-conversation, reset to clean state.
+      // If we reconnected mid-turn, reset to clean state.
       if (appState !== S.IDLE) {
         if (myVAD) myVAD.pause();
+        if (pttRecorder && pttRecorder.state === 'recording') {
+          try { pttRecorder.stop(); } catch (e) { /* ignore */ }
+        }
+        if (pttStream) {
+          pttStream.getTracks().forEach((t) => t.stop());
+          pttStream = null;
+        }
+        pttRecording = false;
+        pttBtn.textContent = 'Push to talk';
+        pttBtn.classList.add('ghost');
+        pttBtn.classList.remove('danger');
         stopAudioPlayback();
         llmStreaming = false;
+        clearBargeInTimer();
+        mode = 'idle';
         setState(S.IDLE);
+        updateButtonStates();
       }
     };
     ws.onclose = () => {
@@ -647,24 +815,40 @@
 
   function reset() {
     if (myVAD) myVAD.pause();
+    if (pttRecorder && pttRecorder.state === 'recording') {
+      try { pttRecorder.stop(); } catch (e) { /* ignore */ }
+    }
+    if (pttStream) {
+      pttStream.getTracks().forEach((t) => t.stop());
+      pttStream = null;
+    }
+    pttRecording = false;
+    pttBtn.textContent = 'Push to talk';
+    pttBtn.classList.add('ghost');
+    pttBtn.classList.remove('danger');
     stopAudioPlayback();
     llmStreaming = false;
+    clearBargeInTimer();
+    mode = 'idle';
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'reset' }));
     } else {
       chat.innerHTML = '';
     }
     setState(S.IDLE);
+    updateButtonStates();
   }
 
   // ---- init ------------------------------------------------------------
 
   convBtn.addEventListener('click', toggleConversation);
+  pttBtn.addEventListener('click', togglePTT);
   resetBtn.addEventListener('click', reset);
   testBtn.addEventListener('click', testTTS);
   llmBackend.addEventListener('change', loadLLMModels);
 
   setState(S.IDLE);
+  updateButtonStates();
   loadBackends();
   loadVoices();
   setupWS();

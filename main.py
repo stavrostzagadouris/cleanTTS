@@ -46,7 +46,12 @@ KOKORO_LANGS = _parse_langs()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "af_bella")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "You are a helpful, concise voice assistant. Keep responses short and natural for speech.",
+    "You are a helpful, concise voice assistant. Replies are spoken aloud, so keep them "
+    "short and natural for speech (no markdown, no bullet lists, no headers). Input is "
+    "transcribed from the user's voice and may contain occasional mis-heard words or odd "
+    "artifacts — if something looks like a transcription glitch, infer what they likely "
+    "meant when context makes it obvious, otherwise ask a brief clarifying question "
+    "rather than answering the literal nonsense.",
 )
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
