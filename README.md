@@ -28,20 +28,54 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 
 ## Setup
 
-```bash
-# create a venv inside the repo
-python3 -m venv venv
+The Python install differs slightly per platform — pick the one that matches
+your machine. After install, the same `main.py` runs on all of them; device
+selection is handled automatically (`WHISPER_DEVICE=auto`, `KOKORO_DEVICE=auto`).
 
-# install PyTorch with CUDA wheels first (required so kokoro/whisper see CUDA)
+### Linux + NVIDIA (CUDA)
+
+```bash
+python3 -m venv venv
 ./venv/bin/pip install --upgrade pip
 ./venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126
-
-# everything else
 ./venv/bin/pip install -r requirements.txt
+sudo apt install ffmpeg
 ```
 
-System packages: `ffmpeg` is required so Whisper can decode the browser's
-WebM audio. Install with `sudo apt install ffmpeg` on Debian/Ubuntu.
+### macOS (Apple Silicon — M1/M2/M3/M4)
+
+No CUDA index URL — the default macOS PyTorch wheel ships with MPS support
+built in.
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install torch
+./venv/bin/pip install -r requirements.txt
+brew install ffmpeg
+```
+
+On Apple Silicon, Kokoro runs on MPS (Apple's GPU). `faster-whisper` /
+CTranslate2 has **no** MPS backend, so Whisper transparently falls back to
+CPU at int8 — fast enough on M-series for short utterances. If you'd
+rather force a different combo, set `WHISPER_DEVICE` and `KOKORO_DEVICE`
+explicitly in `.env` (see `.env.example`).
+
+### Linux/macOS, CPU-only
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install torch
+./venv/bin/pip install -r requirements.txt
+# ffmpeg via your package manager
+```
+
+Set `WHISPER_DEVICE=cpu` and `KOKORO_DEVICE=cpu` in `.env`. Expect slower
+TTS / STT than the accelerated paths, but it works for testing.
+
+> `ffmpeg` is required by Whisper (decoding the browser's WebM audio) and
+> by `/v1/audio/speech` for non-WAV response formats (opus/mp3/flac/aac).
 
 ---
 
@@ -62,8 +96,9 @@ LLM_BACKENDS=[{"name":"5090","url":"http://100.x.y.z:1234/v1"},{"name":"3080","u
 # LLM_BASE_URL=http://100.x.y.z:1234/v1
 
 WHISPER_MODEL=distil-large-v3                  # or 'small', 'medium', etc.
-WHISPER_DEVICE=cuda                            # or 'cpu'
-KOKORO_LANG=a                                  # a=US-English, b=UK, j=JP, z=Mandarin, ...
+WHISPER_DEVICE=auto                            # auto | cuda | cpu (mps not supported by faster-whisper)
+KOKORO_LANGS=a,b                               # comma-separated; one KPipeline per language
+KOKORO_DEVICE=auto                             # auto | cuda | mps | cpu
 DEFAULT_VOICE=af_bella
 SYSTEM_PROMPT=You are a helpful, concise voice assistant. Keep responses short and natural for speech.
 HOST=0.0.0.0

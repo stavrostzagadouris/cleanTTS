@@ -31,7 +31,39 @@ load_dotenv()
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")  # fallback only
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+
+
+def _auto_device() -> str:
+    """Pick the best available accelerator. Prefer CUDA, then MPS, then CPU."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+_AUTO_DEVICE = _auto_device()
+
+# Whisper: faster-whisper / CTranslate2 has no MPS backend. If auto-detect
+# returns mps (Apple Silicon) we silently downgrade Whisper to CPU; Kokoro
+# can still use MPS independently. Explicit "mps" is also remapped, with a
+# warning so the user knows.
+_w_raw = os.getenv("WHISPER_DEVICE", "auto").lower()
+if _w_raw == "auto":
+    WHISPER_DEVICE = "cpu" if _AUTO_DEVICE == "mps" else _AUTO_DEVICE
+elif _w_raw == "mps":
+    log.warning("faster-whisper has no MPS backend; using CPU for Whisper instead.")
+    WHISPER_DEVICE = "cpu"
+else:
+    WHISPER_DEVICE = _w_raw
+
+# Kokoro: PyTorch-based, supports cuda/mps/cpu directly.
+_k_raw = os.getenv("KOKORO_DEVICE", "auto").lower()
+KOKORO_DEVICE = _AUTO_DEVICE if _k_raw == "auto" else _k_raw
 
 
 def _parse_langs() -> list[str]:
@@ -132,10 +164,10 @@ async def lifespan(app: FastAPI):
     )
     log.info("Whisper loaded.")
 
-    log.info("Loading Kokoro pipelines: langs=%s", KOKORO_LANGS)
+    log.info("Loading Kokoro pipelines: langs=%s on %s", KOKORO_LANGS, KOKORO_DEVICE)
     state["kokoro"] = {}
     for lang in KOKORO_LANGS:
-        state["kokoro"][lang] = KPipeline(lang_code=lang)
+        state["kokoro"][lang] = KPipeline(lang_code=lang, device=KOKORO_DEVICE)
     log.info("Kokoro loaded: %d pipeline(s) — %s.", len(state["kokoro"]), ",".join(KOKORO_LANGS))
 
     yield
