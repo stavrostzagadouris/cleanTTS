@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 
@@ -177,18 +178,46 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
 # OpenAI-compatible TTS API (for external tools, e.g. the GT race app)
 # ---------------------------------------------------------------------------
 
+# Maps OpenAI response_format → (Content-Type, ffmpeg args).
+# ffmpeg args is None for native WAV (no transcode). For everything else we
+# pipe Kokoro's WAV through ffmpeg. -c:a is set explicitly where the muxer
+# would otherwise pick a wrong default (e.g. ogg → vorbis instead of opus).
+SUPPORTED_FORMATS: dict[str, tuple[str, list[str] | None]] = {
+    "wav":  ("audio/wav",  None),
+    "opus": ("audio/ogg",  ["-c:a", "libopus", "-f", "ogg"]),
+    "mp3":  ("audio/mpeg", ["-c:a", "libmp3lame", "-f", "mp3"]),
+    "flac": ("audio/flac", ["-f", "flac"]),
+    "aac":  ("audio/aac",  ["-c:a", "aac", "-f", "adts"]),
+    "pcm":  ("audio/pcm",  ["-f", "s16le"]),  # raw 16-bit LE @ 24kHz mono
+}
+
+
+def transcode(wav_bytes: bytes, ffmpeg_args: list[str]) -> bytes:
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+         *ffmpeg_args, "pipe:1"],
+        input=wav_bytes, capture_output=True, check=True,
+    )
+    return proc.stdout
+
+
 class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize.")
     model: str = Field("kokoro", description="Ignored; we always use Kokoro-82M.")
     voice: str = Field(DEFAULT_VOICE, description="Voice id, e.g. af_bella.")
-    response_format: str = Field("wav", description="Only 'wav' is supported.")
+    response_format: str = Field("wav", description="wav | opus | mp3 | flac | aac | pcm")
     speed: float = Field(1.0, ge=0.25, le=4.0)
 
 
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest):
-    if req.response_format.lower() != "wav":
-        raise HTTPException(400, f"response_format '{req.response_format}' not supported. Use 'wav'.")
+    fmt = req.response_format.lower()
+    if fmt not in SUPPORTED_FORMATS:
+        raise HTTPException(
+            400,
+            f"response_format '{req.response_format}' not supported. "
+            f"Use one of: {', '.join(SUPPORTED_FORMATS)}.",
+        )
     if not req.input.strip():
         raise HTTPException(400, "input must not be empty.")
     try:
@@ -200,7 +229,20 @@ async def speech(req: SpeechRequest):
         raise HTTPException(500, f"TTS failed: {e}")
     if not wav_bytes:
         raise HTTPException(500, "TTS produced no audio (Kokoro returned no chunks).")
-    return Response(content=wav_bytes, media_type="audio/wav")
+
+    media_type, ffmpeg_args = SUPPORTED_FORMATS[fmt]
+    if ffmpeg_args is None:
+        return Response(content=wav_bytes, media_type=media_type)
+
+    try:
+        encoded = await asyncio.to_thread(transcode, wav_bytes, ffmpeg_args)
+    except subprocess.CalledProcessError as e:
+        log.error("ffmpeg transcode to %s failed: %s", fmt, e.stderr.decode(errors="ignore"))
+        raise HTTPException(500, f"transcode to {fmt} failed")
+    except FileNotFoundError:
+        raise HTTPException(500, "ffmpeg not installed; required for non-WAV formats.")
+
+    return Response(content=encoded, media_type=media_type)
 
 
 @app.get("/v1/models")
