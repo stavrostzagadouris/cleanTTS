@@ -13,7 +13,7 @@ import httpx
 import numpy as np
 import soundfile as sf
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -244,6 +244,28 @@ async def speech(req: SpeechRequest):
 
     return Response(content=encoded, media_type=media_type)
 
+@app.post("/v1/audio/transcriptions")
+async def transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
+    language: str | None = Form(None),
+    prompt: str | None = Form(None),
+    response_format: str = Form("json"),
+):
+    """OpenAI-compatible Whisper STT: multipart/form-data in, JSON {text} out."""
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(400, "file must not be empty.")
+
+    try:
+        text = await transcribe_bytes(audio_bytes)
+    except Exception as e:
+        log.exception("STT transcription failed")
+        raise HTTPException(500, f"transcription failed: {e}")
+
+    if response_format == "text":
+        return Response(content=text, media_type="text/plain")
+    return {"text": text}
 
 @app.get("/v1/models")
 async def list_models():
