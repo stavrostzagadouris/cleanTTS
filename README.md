@@ -162,6 +162,54 @@ this — they don't need a mic, so the LAN/Tailscale IP works fine for them.
 
 ---
 
+## Updating
+
+### Python packages (Kokoro, Whisper, etc.)
+
+`requirements.txt` is intentionally unpinned, so you track the latest
+releases. To pull newer versions of everything:
+
+```bash
+./venv/bin/pip install -U -r requirements.txt
+```
+
+The TTS model lives in the `kokoro` package (with `misaki`, its
+grapheme→phoneme companion — keep the two in sync, a version mismatch is a
+common breakage). To update just those:
+
+```bash
+./venv/bin/pip install -U kokoro misaki
+```
+
+After any Kokoro/Whisper update, restart `main.py` and run a quick smoke
+test before relying on it:
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"update check","voice":"af_bella"}' --output /tmp/test.wav
+```
+
+Almost all Kokoro updates within the `0.x` line are drop-in. The app only
+touches Kokoro through one function — `synthesize()` in `main.py` — so if a
+future release changes the `KPipeline` API or the 24 kHz sample rate, that
+one function (plus `KOKORO_SAMPLE_RATE`) is the only place you'd need to
+adjust.
+
+### New voices / new languages
+
+New Kokoro voices and languages usually ship as weights on HuggingFace
+(`hexgrad/Kokoro-82M`) and download automatically on first use — no package
+update required. To expose them:
+
+- **New voice in a language you already load** → add its id to
+  `KOKORO_VOICES_BY_LANG` in `main.py` (used for the `/v1/voices` listing;
+  synthesis routes by the voice's first letter regardless).
+- **New language** → add its code to `KOKORO_VOICES_BY_LANG` *and* to
+  `KOKORO_LANGS` in `.env`. A new pipeline (~300 MB) loads for it at startup.
+
+---
+
 ## Conversation mode
 
 The mic button toggles **Start conversation / Stop conversation**. Once
@@ -281,6 +329,34 @@ language isn't loaded returns `400` with a message telling you which
 code to add to `KOKORO_LANGS`.
 
 Note: Kokoro v1 has no Australian English. British is the closest fit.
+
+### Blending voices
+
+A "voice" is just an embedding tensor, so two or more can be averaged into a
+new one. The `voice` field accepts a blend spec anywhere a voice id is used —
+the `/v1/audio/speech` API, the UI's voice picker (click **+ Add voice to
+blend**), and the assistant:
+
+| Spec | Result |
+|---|---|
+| `af_bella` | single voice (unchanged) |
+| `af_bella,af_jessica` | equal 50/50 blend |
+| `af_bella*0.7,af_jessica*0.3` | weighted blend |
+| `af_bella*2,af_jessica` | weights are relative; a missing weight defaults to 1 (→ ~67% / 33%) |
+| `am_adam,bm_lewis` | voices may even be mixed across languages |
+
+Weights don't need to sum to 1 — they're normalized for you. Voice embeddings
+are language-agnostic tensors, so you can blend across languages too
+(`am_adam,bm_lewis`). The only requirement is that the **first** voice's
+language is loaded (per `KOKORO_LANGS`), since that pipeline phonemizes the
+text.
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"half Bella, half Jessica","voice":"af_bella*0.5,af_jessica*0.5"}' \
+  --output blend.wav
+```
 
 ---
 

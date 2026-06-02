@@ -132,6 +132,15 @@
     h2 { margin: 0 0 8px; font-size: 16px; }
     .test-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
 
+    /* voice blender */
+    .blend { display: grid; gap: 6px; }
+    .blend-rows { display: grid; gap: 6px; }
+    .blend-row { display: grid; grid-template-columns: 1fr 76px 40px; gap: 6px; align-items: center; }
+    .blend-row .wt { text-align: center; padding: 10px 6px; }
+    .blend-row .rm { width: auto; padding: 10px 0; }
+    .blend-add { width: auto; justify-self: start; padding: 6px 12px; font-size: 12px; }
+    .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
     code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
   </style>
 </head>
@@ -156,8 +165,9 @@
 
       <div class="row" style="grid-template-columns: 1fr; margin-bottom: 12px;">
         <div>
-          <label for="voice">Voice</label>
-          <select id="voice"><option>Loading…</option></select>
+          <label>Voice</label>
+          <div id="voice-blend" class="blend"></div>
+          <div class="hint">Add voices to blend them; numbers are relative weights.</div>
         </div>
       </div>
 
@@ -179,8 +189,9 @@
       <div class="sub">Same endpoint your external tools should hit: <code>POST /v1/audio/speech</code></div>
       <div class="row" style="margin-bottom: 10px;">
         <div>
-          <label for="test-voice">Voice</label>
-          <select id="test-voice"><option>Loading…</option></select>
+          <label>Voice</label>
+          <div id="test-voice-blend" class="blend"></div>
+          <div class="hint">Add voices to blend them; numbers are relative weights.</div>
         </div>
         <div>
           <label for="test-speed">Speed</label>
@@ -204,8 +215,10 @@
   const stateDot = $('state-dot');
   const llmBackend = $('llm-backend');
   const llmModel = $('llm-model');
-  const voiceSel = $('voice');
-  const testVoice = $('test-voice');
+  // Voice blenders (built once /v1/voices loads). Each exposes getSpec(),
+  // returning either a single voice id or a blend like "af_bella*0.7,af_jessica*0.3".
+  let assistantBlender = null;
+  let testBlender = null;
   const convBtn = $('conv');
   const pttBtn = $('ptt');
   const resetBtn = $('reset');
@@ -355,19 +368,101 @@
     }
   }
 
+  // Build a voice blender into `container`. Starts as a single picker; the
+  // user can add rows (each a voice + relative weight) to blend. getSpec()
+  // returns a plain id for one voice, or "name*weight,name*weight" for a blend.
+  function createVoiceBlender(container, voices, defaultVoice) {
+    container.innerHTML = '';
+    const list = (voices && voices.length) ? voices : [];
+    const rowsEl = document.createElement('div');
+    rowsEl.className = 'blend-rows';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'ghost blend-add';
+    addBtn.textContent = '+ Add voice to blend';
+    container.appendChild(rowsEl);
+    container.appendChild(addBtn);
+
+    const rows = () => [...rowsEl.querySelectorAll('.blend-row')];
+
+    // Weight + remove controls only matter once there's more than one voice;
+    // with a single row this looks and behaves like a plain voice picker.
+    function syncRows() {
+      const rws = rows();
+      const single = rws.length <= 1;
+      rws.forEach((r) => {
+        r.querySelector('.wt').style.display = single ? 'none' : '';
+        r.querySelector('.rm').style.display = single ? 'none' : '';
+      });
+    }
+
+    // Every row offers every loaded voice. Blends may mix languages freely —
+    // the embeddings are just averaged; the text is phonemized by the first
+    // voice's language (handled server-side).
+    function makeRow(selected) {
+      const row = document.createElement('div');
+      row.className = 'blend-row';
+
+      const sel = document.createElement('select');
+      if (!list.length) {
+        const o = document.createElement('option');
+        o.value = ''; o.textContent = '(none available)';
+        sel.appendChild(o);
+      } else {
+        list.forEach((v) => {
+          const o = document.createElement('option');
+          o.value = v; o.textContent = v;
+          sel.appendChild(o);
+        });
+        if (selected) sel.value = selected;
+      }
+
+      const wt = document.createElement('input');
+      wt.type = 'number'; wt.className = 'wt';
+      wt.step = '0.1'; wt.min = '0'; wt.value = '1';
+      wt.title = 'Relative weight';
+
+      const rm = document.createElement('button');
+      rm.type = 'button'; rm.className = 'danger rm';
+      rm.textContent = '×'; rm.title = 'Remove this voice';
+      rm.addEventListener('click', () => { row.remove(); syncRows(); });
+
+      row.appendChild(sel); row.appendChild(wt); row.appendChild(rm);
+      rowsEl.appendChild(row);
+      syncRows();
+    }
+
+    addBtn.addEventListener('click', () => makeRow(defaultVoice));
+    makeRow(defaultVoice);
+
+    return {
+      getSpec() {
+        const parts = [];
+        rows().forEach((r) => {
+          const name = r.querySelector('select').value;
+          if (!name) return;
+          const w = parseFloat(r.querySelector('.wt').value);
+          parts.push({ name, w: (isFinite(w) && w >= 0) ? w : 1 });
+        });
+        if (!parts.length) return defaultVoice || '';
+        if (parts.length === 1) return parts[0].name;
+        return parts.map((p) => `${p.name}*${p.w}`).join(',');
+      },
+    };
+  }
+
   async function loadVoices() {
+    let voices = [], def = '';
     try {
       const r = await fetch('/v1/voices');
       const data = await r.json();
-      fillSelect(voiceSel, data.voices, []);
-      fillSelect(testVoice, data.voices, []);
-      if (data.default) {
-        voiceSel.value = data.default;
-        testVoice.value = data.default;
-      }
+      voices = data.voices || [];
+      def = data.default || '';
     } catch (e) {
       console.error(e);
     }
+    assistantBlender = createVoiceBlender($('voice-blend'), voices, def);
+    testBlender = createVoiceBlender($('test-voice-blend'), voices, def);
   }
 
   // ---- chat rendering --------------------------------------------------
@@ -525,7 +620,7 @@
       audio: b64,
       llm_backend: llmBackend.value,
       llm_model: llmModel.value,
-      voice: voiceSel.value,
+      voice: assistantBlender ? assistantBlender.getSpec() : '',
     }));
     setState(S.PROCESSING);
   }
@@ -688,7 +783,7 @@
         audio: b64,
         llm_backend: llmBackend.value,
         llm_model: llmModel.value,
-        voice: voiceSel.value,
+        voice: assistantBlender ? assistantBlender.getSpec() : '',
       }));
       setState(S.PROCESSING);
     });
@@ -789,7 +884,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           input: text,
-          voice: testVoice.value,
+          voice: testBlender ? testBlender.getSpec() : '',
           speed: parseFloat(testSpeed.value) || 1.0,
         }),
       });

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import httpx
 import numpy as np
 import soundfile as sf
+import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, Response
@@ -180,19 +181,88 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 
+def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
+    """Parse a voice spec into (voice_id, weight) pairs.
+
+    Supports blending:
+      "af_bella"                     -> [("af_bella", 1.0)]              single
+      "af_bella,af_jessica"          -> equal blend (both weight 1.0)
+      "af_bella*0.7,af_jessica*0.3"  -> weighted blend
+
+    A voice with no '*weight' suffix defaults to 1.0, so an unweighted spec
+    behaves exactly as before. Weights are relative — they're normalized to
+    sum to 1 at blend time, so '2,1' means the same as '0.67,0.33'.
+    """
+    pairs: list[tuple[str, float]] = []
+    for piece in (spec or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        name, sep, w = piece.partition("*")
+        name = name.strip()
+        if not name:
+            continue
+        if sep:
+            try:
+                weight = float(w)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid weight in {piece!r}; expected e.g. 'af_bella*0.7'."
+                )
+            if weight < 0:
+                raise ValueError(f"Voice weight must be >= 0 (got {weight!r} in {piece!r}).")
+        else:
+            weight = 1.0
+        pairs.append((name, weight))
+    if not pairs:
+        raise ValueError("No voice specified.")
+    return pairs
+
+
 def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
-    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz). Picks the right
-    pipeline based on the voice's lang_code prefix (e.g. 'bf_emma' → 'b')."""
+    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz).
+
+    `voice` is a spec that supports blending (see parse_voice_spec):
+      - "af_bella"                      single voice
+      - "af_bella,af_jessica"           equal 50/50 blend
+      - "af_bella*0.7,af_jessica*0.3"   weighted blend (normalized)
+
+    The pipeline only phonemizes the *text*, so it's selected from the FIRST
+    voice's lang_code prefix (e.g. 'bf_emma' → 'b'), and that language must be
+    loaded. Voice embeddings themselves are language-agnostic tensors of
+    identical shape, so a blend can freely mix voices across languages
+    (e.g. 'am_adam,bm_lewis') — Kokoro just averages the style vectors. We
+    don't pre-validate voice ids; an unknown one surfaces as Kokoro's own
+    error rather than a guess here.
+    """
     pipelines: dict[str, KPipeline] = state["kokoro"]
-    lang = voice[0] if voice else KOKORO_LANGS[0]
+    pairs = parse_voice_spec(voice)
+
+    lang = pairs[0][0][0]
     pipeline = pipelines.get(lang)
     if pipeline is None:
         raise ValueError(
-            f"Voice {voice!r} requires KOKORO_LANGS to include {lang!r}; "
+            f"Voice {pairs[0][0]!r} requires KOKORO_LANGS to include {lang!r}; "
             f"loaded: {sorted(pipelines.keys())}"
         )
+
+    # A single unweighted voice is passed through as its id (Kokoro handles it
+    # normally). Anything else is a blend: load each voice's full embedding
+    # pack and combine into a normalized weighted-mean tensor, which the
+    # pipeline accepts directly in place of a voice id.
+    if len(pairs) == 1 and pairs[0][1] == 1.0:
+        voice_arg: object = pairs[0][0]
+    else:
+        total = sum(w for _, w in pairs)
+        if total <= 0:
+            raise ValueError("Voice weights sum to zero; nothing to blend.")
+        packs = [pipeline.load_single_voice(name) for name, _ in pairs]
+        voice_arg = torch.stack(
+            [pack * (w / total) for pack, (_, w) in zip(packs, pairs)]
+        ).sum(dim=0)
+
     chunks = []
-    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+    for _, _, audio in pipeline(text, voice=voice_arg, speed=speed):
         if hasattr(audio, "cpu"):
             audio = audio.cpu().numpy()
         elif hasattr(audio, "numpy"):
@@ -236,7 +306,15 @@ def transcode(wav_bytes: bytes, ffmpeg_args: list[str]) -> bytes:
 class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize.")
     model: str = Field("kokoro", description="Ignored; we always use Kokoro-82M.")
-    voice: str = Field(DEFAULT_VOICE, description="Voice id, e.g. af_bella.")
+    voice: str = Field(
+        DEFAULT_VOICE,
+        description=(
+            "Voice id (e.g. af_bella), or a blend: 'af_bella,af_jessica' for an "
+            "equal mix, or 'af_bella*0.7,af_jessica*0.3' for a weighted one. "
+            "Voices may be mixed across languages; the first voice's language "
+            "must be loaded (it phonemizes the text)."
+        ),
+    )
     response_format: str = Field("wav", description="wav | opus | mp3 | flac | aac | pcm")
     speed: float = Field(1.0, ge=0.25, le=4.0)
 
