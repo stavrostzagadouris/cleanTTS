@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent template for cleanTTS.
+
+  Replace REPO_DIR, VENV_DIR and HOME_DIR below, then:
+
+    cp deploy/com.cleantts.plist ~/Library/LaunchAgents/
+    mkdir -p ~/Library/Logs/cleanTTS
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cleantts.plist
+
+  A LaunchAgent (not a LaunchDaemon) is correct here: Kokoro and pyannote need
+  MPS, and Metal is only reachable from inside a logged-in user session.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cleantts</string>
+
+    <!-- Full path to the venv interpreter — the venv need not live in the repo. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>VENV_DIR/bin/python3</string>
+        <string>REPO_DIR/main.py</string>
+    </array>
+
+    <!-- Required: main.py resolves .env, templates/ and static/ relatively. -->
+    <key>WorkingDirectory</key>
+    <string>REPO_DIR</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which does
+             NOT include Homebrew. ffmpeg must be findable or /v1/audio/diarize
+             and every non-WAV /v1/audio/speech format fail at runtime. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it ever exits, for any reason. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Exempt from the CPU/IO throttling launchd applies to background jobs:
+         this serves realtime STT/TTS. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>HOME_DIR/Library/Logs/cleanTTS/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>HOME_DIR/Library/Logs/cleanTTS/stderr.log</string>
+</dict>
+</plist>

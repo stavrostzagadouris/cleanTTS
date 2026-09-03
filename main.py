@@ -35,6 +35,15 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
 # beam_size=1 (greedy) is ~2x faster and near-identical quality on distil
 # models; 5 is the faster-whisper default and safest for accuracy.
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+# Silero VAD pre-pass. Without it, faster-whisper reports every segment as
+# starting at 0.00 when the clip has leading silence (measured up to 20s off),
+# and it hallucinates a phrase — "you", "Thank you." — out of speech-free
+# audio. With it, onsets land within 0.1s and speech-free audio yields no
+# segments. Real speech is unaffected down to at least -50dB, and it costs
+# ~7ms. Set WHISPER_VAD_FILTER=false for the pre-0.2 behaviour.
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 def _auto_device() -> str:
@@ -68,6 +77,16 @@ else:
 # Kokoro: PyTorch-based, supports cuda/mps/cpu directly.
 _k_raw = os.getenv("KOKORO_DEVICE", "auto").lower()
 KOKORO_DEVICE = _AUTO_DEVICE if _k_raw == "auto" else _k_raw
+
+# Diarization (pyannote): plain PyTorch, so unlike Whisper it runs on MPS. On
+# Apple Silicon this is the one stage the GPU genuinely accelerates, so "auto"
+# is left at the raw auto-detect (no CPU downgrade).
+_d_raw = os.getenv("DIARIZE_DEVICE", "auto").lower()
+DIARIZE_DEVICE = _AUTO_DEVICE if _d_raw == "auto" else _d_raw
+DIARIZE_MODEL = os.getenv("DIARIZE_MODEL", "pyannote/speaker-diarization-community-1")
+# The pyannote model is gated: the token's HF account must have accepted its
+# terms. Falls back to whatever `huggingface-cli login` cached.
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or None
 
 
 def _parse_langs() -> list[str]:
@@ -363,6 +382,44 @@ async def speech(req: SpeechRequest):
 
     return Response(content=encoded, media_type=media_type)
 
+
+def segments_text(segments: list) -> str:
+    """Join Whisper segments into one transcript, as the /ws pipeline expects."""
+    return "".join(s.text for s in segments).strip()
+
+
+def verbose_payload(segments: list, info) -> dict:
+    """Render (segments, info) in OpenAI's verbose_json shape.
+
+    The scores are the point of this format, not decoration: clients filter
+    Whisper hallucinations on no_speech_prob (background room speech scores
+    ~0.67 where real speech scores ~0.12) and gauge confidence on avg_logprob.
+    """
+    return {
+        "task": "transcribe",
+        "language": info.language,
+        "duration": round(info.duration, 3),
+        "text": segments_text(segments),
+        "segments": [
+            # id is renumbered from 0 to match OpenAI; faster-whisper's own
+            # segment ids start at 1.
+            {
+                "id": i,
+                "seek": s.seek,
+                "start": round(s.start, 3),
+                "end": round(s.end, 3),
+                "text": s.text,
+                "tokens": list(s.tokens),
+                "temperature": s.temperature,
+                "avg_logprob": s.avg_logprob,
+                "compression_ratio": s.compression_ratio,
+                "no_speech_prob": s.no_speech_prob,
+            }
+            for i, s in enumerate(segments)
+        ],
+    }
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
@@ -370,21 +427,198 @@ async def transcriptions(
     language: str | None = Form(None),
     prompt: str | None = Form(None),
     response_format: str = Form("json"),
+    vad_filter: bool | None = Form(None),
 ):
-    """OpenAI-compatible Whisper STT: multipart/form-data in, JSON {text} out."""
+    """OpenAI-compatible Whisper STT: multipart/form-data in, JSON {text} out.
+
+    response_format: "json" (default) | "text" | "verbose_json". The default
+    stays exactly {"text": ...}; verbose_json additionally exposes per-segment
+    timings and scores. Anything unrecognised still falls back to the default,
+    as before.
+
+    Note `model` is accepted for OpenAI compatibility but ignored — the server
+    loads WHISPER_MODEL once at startup and serves every request from it.
+
+    vad_filter overrides WHISPER_VAD_FILTER for this request. Leave it unset
+    unless you specifically want the other behaviour: with VAD off, segment
+    timings collapse to 0.00 on clips with leading silence.
+    """
     audio_bytes = await file.read()
     if not audio_bytes:
         raise HTTPException(400, "file must not be empty.")
 
+    fmt = (response_format or "json").lower()
     try:
-        text = await transcribe_bytes(audio_bytes, language=language, initial_prompt=prompt)
+        segments, info = await transcribe_segments(
+            audio_bytes, language=language, initial_prompt=prompt,
+            vad_filter=vad_filter,
+        )
     except Exception as e:
         log.exception("STT transcription failed")
         raise HTTPException(500, f"transcription failed: {e}")
 
-    if response_format == "text":
-        return Response(content=text, media_type="text/plain")
-    return {"text": text}
+    if fmt == "text":
+        return Response(content=segments_text(segments), media_type="text/plain")
+    if fmt == "verbose_json":
+        return verbose_payload(segments, info)
+    return {"text": segments_text(segments)}
+
+
+# ---------------------------------------------------------------------------
+# Speaker diarization (pyannote) — "who spoke when"
+# ---------------------------------------------------------------------------
+
+# pyannote's models expect 16 kHz; diarization is speaker-level, so a mono
+# downmix is what we want regardless of how many channels came in.
+DIARIZE_SAMPLE_RATE = 16000
+
+# Serializes the one-time lazy load so two simultaneous first requests don't
+# both pull the model. Deliberately NOT shared with the Whisper path — the /ws
+# voice pipeline never waits on this.
+_diarize_load_lock = asyncio.Lock()
+
+
+def load_diarization_pipeline():
+    """Build the pyannote pipeline. Blocking — always call via to_thread."""
+    from pyannote.audio import Pipeline as PyannotePipeline
+
+    if not HF_TOKEN:
+        raise HTTPException(
+            503,
+            f"diarization needs an HF token: {DIARIZE_MODEL} is a gated model. "
+            "Set HF_TOKEN in .env (the account must have accepted the model's "
+            "terms on huggingface.co) and restart.",
+        )
+
+    pipeline = PyannotePipeline.from_pretrained(DIARIZE_MODEL, token=HF_TOKEN)
+    # from_pretrained returns None instead of raising when the token can't
+    # reach the repo, so an unchecked return would fail later as a confusing
+    # 'NoneType is not callable'.
+    if pipeline is None:
+        raise HTTPException(
+            503,
+            f"could not load {DIARIZE_MODEL}: pyannote returned no pipeline. "
+            "Usually the HF token is invalid, or its account hasn't accepted "
+            "the model's terms on huggingface.co.",
+        )
+
+    pipeline.to(torch.device(DIARIZE_DEVICE))
+    return pipeline
+
+
+async def get_diarization_pipeline():
+    """Return the shared pyannote pipeline, loading it on first use.
+
+    Loaded lazily rather than in lifespan: diarization is occasional, and the
+    voice bot shouldn't pay for it in startup time or resident memory. A failed
+    load isn't cached, so fixing the token and retrying just works.
+    """
+    pipeline = state.get("diarize")
+    if pipeline is not None:
+        return pipeline
+    async with _diarize_load_lock:
+        pipeline = state.get("diarize")
+        if pipeline is not None:
+            return pipeline
+        log.info("Loading diarization: %s on %s", DIARIZE_MODEL, DIARIZE_DEVICE)
+        pipeline = await asyncio.to_thread(load_diarization_pipeline)
+        state["diarize"] = pipeline
+        log.info("Diarization loaded.")
+        return pipeline
+
+
+def decode_mono_f32(audio_bytes: bytes) -> np.ndarray:
+    """Decode any ffmpeg-readable audio to mono float32 @ DIARIZE_SAMPLE_RATE.
+
+    We decode here and hand pyannote an in-memory waveform. Given a *path* it
+    decodes via torchcodec, which needs FFmpeg's shared libraries installed
+    next to the Python package; the ffmpeg CLI we already require for
+    /v1/audio/speech is enough for this route.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+         "-f", "f32le", "-ac", "1", "-ar", str(DIARIZE_SAMPLE_RATE), "pipe:1"],
+        input=audio_bytes, capture_output=True, check=True,
+    )
+    # frombuffer is read-only and torch needs to own its storage; copy().
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
+
+
+def diarize_bytes(
+    pipeline,
+    audio_bytes: bytes,
+    num_speakers: int | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[dict]:
+    """Run diarization on raw audio bytes. Blocking — call via to_thread."""
+    wav = decode_mono_f32(audio_bytes)
+    if wav.size == 0:
+        raise ValueError("no decodable audio in file.")
+
+    # pyannote wants (channel, time).
+    waveform = torch.from_numpy(wav).unsqueeze(0)
+
+    # Only forward the hints that were actually given; pyannote picks the
+    # speaker count itself otherwise, and rejects bad combinations better than
+    # a guess here would.
+    hints = {
+        k: v for k, v in (
+            ("num_speakers", num_speakers),
+            ("min_speakers", min_speakers),
+            ("max_speakers", max_speakers),
+        ) if v is not None
+    }
+
+    output = pipeline(
+        {"waveform": waveform, "sample_rate": DIARIZE_SAMPLE_RATE}, **hints
+    )
+    # pyannote 4 wraps the result: DiarizeOutput.speaker_diarization. Older
+    # pipelines return the Annotation directly.
+    annotation = getattr(output, "speaker_diarization", output)
+
+    return [
+        {"start": round(turn.start, 3), "end": round(turn.end, 3), "speaker": speaker}
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
+    ]
+
+
+@app.post("/v1/audio/diarize")
+async def diarize(
+    file: UploadFile = File(...),
+    num_speakers: int | None = Form(None),
+    min_speakers: int | None = Form(None),
+    max_speakers: int | None = Form(None),
+):
+    """Speaker diarization: multipart audio in, {"turns": [...]} out.
+
+    Optional num_speakers pins the count exactly; min_speakers/max_speakers
+    bound it. Omit all three to let pyannote decide.
+    """
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(400, "file must not be empty.")
+
+    pipeline = await get_diarization_pipeline()
+
+    try:
+        turns = await asyncio.to_thread(
+            diarize_bytes, pipeline, audio_bytes,
+            num_speakers, min_speakers, max_speakers,
+        )
+    except subprocess.CalledProcessError as e:
+        log.error("diarize decode failed: %s", e.stderr.decode(errors="ignore"))
+        raise HTTPException(400, "could not decode audio file.")
+    except FileNotFoundError:
+        raise HTTPException(500, "ffmpeg not installed; required for diarization.")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("diarization failed")
+        raise HTTPException(500, f"diarization failed: {e}")
+
+    return {"turns": turns}
+
 
 @app.get("/health")
 async def health():
@@ -392,8 +626,20 @@ async def health():
     so a 200 here means both Whisper and Kokoro are ready."""
     return {
         "status": "ok",
-        "whisper": {"model": WHISPER_MODEL, "device": WHISPER_DEVICE},
+        "whisper": {
+            "model": WHISPER_MODEL,
+            "device": WHISPER_DEVICE,
+            # Additive field; "model" and "device" are unchanged.
+            "vad_filter": WHISPER_VAD_FILTER,
+        },
         "kokoro": {"langs": KOKORO_LANGS, "device": KOKORO_DEVICE},
+        # Additive: diarization loads lazily, so "loaded" says whether the
+        # first request has paid for it yet. Existing keys are untouched.
+        "diarization": {
+            "model": DIARIZE_MODEL,
+            "device": DIARIZE_DEVICE,
+            "loaded": state.get("diarize") is not None,
+        },
     }
 
 
@@ -462,27 +708,58 @@ def drain_sentences(buf: str) -> tuple[list[str], str]:
     return sentences, buf
 
 
-async def transcribe_bytes(
+async def transcribe_segments(
     audio_bytes: bytes,
     language: str | None = None,
     initial_prompt: str | None = None,
-) -> str:
-    """Write to a temp file (so ffmpeg can decode webm/ogg/etc) and run Whisper."""
+    vad_filter: bool | None = None,
+) -> tuple[list, object]:
+    """Write to a temp file (so ffmpeg can decode webm/ogg/etc), run Whisper and
+    return (segments, info) with every field faster-whisper produced.
+
+    faster-whisper's `transcribe()` only *builds* a lazy generator; the actual
+    decode happens while iterating it. So the iteration is drained inside the
+    same to_thread call — otherwise the decode runs on the event loop and stalls
+    the /ws pipeline sharing it.
+
+    vad_filter=None uses the WHISPER_VAD_FILTER default; pass a bool to override
+    it per call.
+    """
+    use_vad = WHISPER_VAD_FILTER if vad_filter is None else vad_filter
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(audio_bytes)
         path = f.name
-    try:
+
+    def _run() -> tuple[list, object]:
         whisper: WhisperModel = state["whisper"]
-        segments, _ = await asyncio.to_thread(
-            whisper.transcribe, path, beam_size=WHISPER_BEAM_SIZE,
+        segments, info = whisper.transcribe(
+            path, beam_size=WHISPER_BEAM_SIZE,
             language=language, initial_prompt=initial_prompt,
+            vad_filter=use_vad,
         )
-        return "".join(s.text for s in segments).strip()
+        return list(segments), info
+
+    try:
+        return await asyncio.to_thread(_run)
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
+
+
+async def transcribe_bytes(
+    audio_bytes: bytes,
+    language: str | None = None,
+    initial_prompt: str | None = None,
+    vad_filter: bool | None = None,
+) -> str:
+    """Plain-text transcription. Contract is `-> str`: this is what the /ws voice
+    pipeline and the default /v1/audio/transcriptions response use."""
+    segments, _ = await transcribe_segments(
+        audio_bytes, language, initial_prompt, vad_filter
+    )
+    return segments_text(segments)
 
 
 async def run_pipeline(msg: dict, history: list[dict], send) -> None:

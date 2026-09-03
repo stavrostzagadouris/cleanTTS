@@ -9,3 +9,8 @@ kokoro
 misaki
 soundfile
 numpy
+torch
+# Diarization only (POST /v1/audio/diarize). pyannote 3.x is broken on current
+# torchaudio (it imports the removed AudioMetaData), and 4.x renamed
+# from_pretrained's use_auth_token kwarg to token — so the major version is pinned.
+pyannote.audio>=4,<5

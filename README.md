@@ -20,8 +20,11 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 | `GET /` | Voice assistant UI (mic → STT → LLM → TTS) |
 | `WS /ws` | WebSocket for the voice assistant pipeline |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
+| `POST /v1/audio/transcriptions` | OpenAI-compatible Whisper STT (`json` / `text` / `verbose_json`) |
+| `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote, runs on MPS) |
 | `GET /v1/voices` | Available Kokoro voices |
 | `GET /v1/models` | OpenAI-compat model list (always returns `kokoro`) |
+| `GET /health` | Liveness + which models/devices are loaded |
 | `GET /api/llm-models` | Discovery for the configured LLM backend |
 
 ---
@@ -237,6 +240,160 @@ If you find the assistant interrupts itself:
 - Lower your speaker volume so AEC has an easier time.
 - Some Linux audio stacks (PipeWire) need extra config; `echo-cancel` is
   a separate module there.
+
+---
+
+## Running as a service (macOS, launchd)
+
+`deploy/com.cleantts.plist` is a LaunchAgent template. Substitute `REPO_DIR`,
+`VENV_DIR` and `HOME_DIR`, then:
+
+```bash
+cp deploy/com.cleantts.plist ~/Library/LaunchAgents/
+mkdir -p ~/Library/Logs/cleanTTS
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cleantts.plist
+```
+
+Managing it:
+
+```bash
+launchctl print gui/$(id -u)/com.cleantts        # state, pid, restart count
+launchctl kickstart -k gui/$(id -u)/com.cleantts # restart (after a code change)
+launchctl bootout gui/$(id -u)/com.cleantts      # stop and disable
+tail -f ~/Library/Logs/cleanTTS/stderr.log       # logs
+```
+
+Three things that are easy to get wrong:
+
+- **Agent, not daemon.** Kokoro and pyannote need MPS, and Metal is only
+  reachable from inside a logged-in user session. A LaunchDaemon runs in the
+  system context before login and cannot use the GPU.
+- **`PATH` must be set explicitly.** launchd hands a job
+  `/usr/bin:/bin:/usr/sbin:/sbin` with no Homebrew, so `ffmpeg` would be
+  invisible — breaking `/v1/audio/diarize` and every non-WAV
+  `/v1/audio/speech` format, at request time rather than at startup.
+- **`WorkingDirectory` must be the repo.** `main.py` resolves `.env`,
+  `templates/` and `static/` relatively.
+
+The agent starts at **login**, not at boot. With FileVault enabled that is the
+best available: the volume is encrypted until someone enters the password at
+the boot screen, so nothing — agent or daemon — can run before that. After the
+unlock (which logs you in) the service comes up on its own and `KeepAlive`
+keeps it up.
+
+### Binding, and what it means for `localhost`
+
+`HOST=0.0.0.0` binds every interface, which is only safe behind a NAT or
+firewall — cleanTTS has no authentication and proxies to the configured LLM
+backends. On a machine whose `en0` holds a globally routable address (check
+with `ipconfig getifaddr en0`) with the macOS firewall off, prefer binding a
+single VPN address, e.g. this host's Tailscale IP:
+
+```bash
+HOST=100.x.y.z    # `tailscale ip -4`
+```
+
+Two consequences worth knowing:
+
+- **uvicorn binds exactly one address**, so `localhost:5000` and `127.0.0.1:5000`
+  stop resolving. Local clients must use the Tailscale IP or hostname too.
+- **The Tailscale interface appears at login**, roughly when the agent starts,
+  so the first bind can lose the race and fail with
+  `[Errno 49] can't assign requested address`. `KeepAlive` retries and it
+  self-heals within seconds — but uvicorn runs the app's lifespan *before*
+  binding, so each failed attempt loads Whisper and Kokoro first, making a
+  retry cycle ~15s. If you'd rather not have that startup dependency, keep
+  `HOST=0.0.0.0` and block port 5000 on the public interface with a `pf` rule
+  instead.
+
+launchd does not rotate `StandardOutPath` / `StandardErrorPath`. The logs are
+low-volume, but they grow without bound; truncate them occasionally or add a
+`newsyslog.d` rule.
+
+---
+
+## Speech-to-text and diarization
+
+### `POST /v1/audio/transcriptions`
+
+OpenAI-compatible. Multipart `file`, optional `language` and `prompt`.
+`response_format` is `json` (default), `text`, or `verbose_json`.
+
+`json` returns just `{"text": "..."}`. `verbose_json` additionally returns
+per-segment timings and the scores faster-whisper computed:
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/transcriptions \
+  -F file=@clip.wav -F response_format=verbose_json
+```
+
+```json
+{"task": "transcribe", "language": "en", "duration": 12.3, "text": "...",
+ "segments": [{"id": 0, "start": 1.2, "end": 3.4, "text": "...",
+               "avg_logprob": -0.61, "no_speech_prob": 0.116,
+               "compression_ratio": 1.4, "temperature": 0.0}]}
+```
+
+### The VAD pre-pass
+
+`WHISPER_VAD_FILTER` defaults to **on**, and affects both this endpoint and the
+`/ws` voice pipeline. Without it, faster-whisper has two failure modes on real
+recordings:
+
+| input | `vad_filter=false` | `vad_filter=true` |
+|---|---|---|
+| speech after 10s of silence | segment reads `[0.00-12.00]` | `[9.94-…]` |
+| speech after 20s of silence | segment reads `[0.00-13.00]` | `[19.95-…]` |
+| 12s of digital silence | `"you"` | `""` |
+| 12s of room noise, no speech | `"Thank you."` | `""` |
+| real speech, even at -50dB | correct | correct (unchanged) |
+
+So segment timings are unusable on any clip with leading silence, and
+speech-free audio produces a confabulated phrase that a voice assistant will
+then answer. Cost is ~7ms per request. `POST /v1/audio/transcriptions` accepts
+a per-request `vad_filter` form field if you need the old behaviour for one
+call; `GET /health` reports the server default under `whisper.vad_filter`.
+
+Note the VAD changes `no_speech_prob` slightly (it removes the silence the
+score was partly computed over), so calibrate any threshold against the
+setting you actually run.
+
+`no_speech_prob` is the useful one for filtering Whisper hallucinations —
+real speech scores low (~0.1), while faint background speech picked up by the
+OS-level capture scores high (~0.67), so a threshold around `0.6` separates
+them. `avg_logprob` gives overall confidence.
+
+The `model` field is accepted for compatibility but ignored: the server loads
+`WHISPER_MODEL` once at startup and serves every request from it.
+
+### `POST /v1/audio/diarize`
+
+Multipart `file`, plus optional `num_speakers` (pins the count exactly) or
+`min_speakers` / `max_speakers` (bound it). Omit all three to let pyannote
+decide.
+
+```bash
+curl -X POST http://localhost:5000/v1/audio/diarize -F file=@meeting.wav
+```
+
+```json
+{"turns": [{"start": 0.5, "end": 4.2, "speaker": "SPEAKER_00"}]}
+```
+
+Notes:
+
+- The default model `pyannote/speaker-diarization-community-1` is **gated**.
+  `HF_TOKEN` must belong to an account that has accepted its terms on
+  huggingface.co, or the route answers `503`.
+- Unlike faster-whisper (CTranslate2, which has no Metal backend — hence
+  `/health` reporting Whisper on `cpu`), pyannote is plain PyTorch and runs on
+  **MPS**. On Apple Silicon this is the one stage the GPU really accelerates:
+  roughly 28x realtime, i.e. ~9s for a 4-minute recording.
+- The pipeline loads **lazily on the first request**, so it costs nothing in
+  startup time or memory until used. `/health` reports whether it is loaded.
+- Kokoro also uses MPS, so a long diarization and TTS compete for the GPU:
+  synthesis slows roughly 5x while one is running. STT is unaffected (it is on
+  CPU) and the server stays responsive throughout.
 
 ---
 
