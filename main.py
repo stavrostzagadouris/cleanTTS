@@ -207,7 +207,10 @@ async def lifespan(app: FastAPI):
     state["parakeet_models"] = {}
     _default = resolve_whisper_model(None)
     if is_parakeet(_default):
-        log.info("Default STT is Parakeet (%s); Whisper loads on demand.", _default)
+        # NOT preloaded here: MLX state is thread-affine, and the model must be
+        # created on the same thread that runs inference (see PARAKEET_EXECUTOR).
+        # get_parakeet_model handles it on first use.
+        log.info("Default STT is Parakeet (%s); loads on first use.", _default)
     else:
         log.info("Loading Whisper: %s on %s", _default, WHISPER_DEVICE)
         state["whisper_models"][_default] = load_whisper_model(_default)
