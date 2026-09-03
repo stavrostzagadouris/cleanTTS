@@ -32,6 +32,9 @@ load_dotenv()
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")  # fallback only
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
+# beam_size=1 (greedy) is ~2x faster and near-identical quality on distil
+# models; 5 is the faster-whisper default and safest for accuracy.
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 
 
 def _auto_device() -> str:
@@ -171,8 +174,14 @@ async def lifespan(app: FastAPI):
         state["kokoro"][lang] = KPipeline(lang_code=lang, device=KOKORO_DEVICE)
     log.info("Kokoro loaded: %d pipeline(s) — %s.", len(state["kokoro"]), ",".join(KOKORO_LANGS))
 
+    # One shared client for all outbound LLM traffic: keeps connections alive
+    # between turns instead of a TCP handshake per request. Timeouts are set
+    # per-request at the call sites.
+    state["http"] = httpx.AsyncClient()
+
     yield
 
+    await state["http"].aclose()
     state.clear()
 
 
@@ -368,7 +377,7 @@ async def transcriptions(
         raise HTTPException(400, "file must not be empty.")
 
     try:
-        text = await transcribe_bytes(audio_bytes)
+        text = await transcribe_bytes(audio_bytes, language=language, initial_prompt=prompt)
     except Exception as e:
         log.exception("STT transcription failed")
         raise HTTPException(500, f"transcription failed: {e}")
@@ -376,6 +385,17 @@ async def transcriptions(
     if response_format == "text":
         return Response(content=text, media_type="text/plain")
     return {"text": text}
+
+@app.get("/health")
+async def health():
+    """Cheap liveness probe for external tools — models are loaded at startup,
+    so a 200 here means both Whisper and Kokoro are ready."""
+    return {
+        "status": "ok",
+        "whisper": {"model": WHISPER_MODEL, "device": WHISPER_DEVICE},
+        "kokoro": {"langs": KOKORO_LANGS, "device": KOKORO_DEVICE},
+    }
+
 
 @app.get("/v1/models")
 async def list_models():
@@ -414,11 +434,11 @@ async def llm_backends():
 async def llm_models(backend: str | None = None):
     b = _find_backend(backend)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{b['url']}/models")
-            r.raise_for_status()
-            data = r.json()
-            return {"models": [m["id"] for m in data.get("data", [])], "backend": b["name"]}
+        client: httpx.AsyncClient = state["http"]
+        r = await client.get(f"{b['url']}/models", timeout=5.0)
+        r.raise_for_status()
+        data = r.json()
+        return {"models": [m["id"] for m in data.get("data", [])], "backend": b["name"]}
     except Exception as e:
         log.warning("LLM model list failed (%s): %s", b["name"], e)
         return {"models": [], "backend": b["name"], "error": str(e)}
@@ -442,7 +462,11 @@ def drain_sentences(buf: str) -> tuple[list[str], str]:
     return sentences, buf
 
 
-async def transcribe_bytes(audio_bytes: bytes) -> str:
+async def transcribe_bytes(
+    audio_bytes: bytes,
+    language: str | None = None,
+    initial_prompt: str | None = None,
+) -> str:
     """Write to a temp file (so ffmpeg can decode webm/ogg/etc) and run Whisper."""
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(audio_bytes)
@@ -450,7 +474,8 @@ async def transcribe_bytes(audio_bytes: bytes) -> str:
     try:
         whisper: WhisperModel = state["whisper"]
         segments, _ = await asyncio.to_thread(
-            whisper.transcribe, path, beam_size=5
+            whisper.transcribe, path, beam_size=WHISPER_BEAM_SIZE,
+            language=language, initial_prompt=initial_prompt,
         )
         return "".join(s.text for s in segments).strip()
     finally:
@@ -517,51 +542,52 @@ async def run_pipeline(msg: dict, history: list[dict], send) -> None:
 
     try:
         buf = ""
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            payload = {
-                "model": llm_model,
-                "messages": history,
-                "stream": True,
-                "temperature": 0.7,
-                "max_tokens": 1024,
-            }
-            if backend.get("chat_template_kwargs"):
-                payload["chat_template_kwargs"] = backend["chat_template_kwargs"]
-            async with client.stream(
-                "POST", f"{backend['url']}/chat/completions", json=payload
-            ) as r:
-                r.raise_for_status()
-                async for line in r.aiter_lines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    chunk = line[5:].strip()
-                    if chunk == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(chunk)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
+        client: httpx.AsyncClient = state["http"]
+        payload = {
+            "model": llm_model,
+            "messages": history,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        }
+        if backend.get("chat_template_kwargs"):
+            payload["chat_template_kwargs"] = backend["chat_template_kwargs"]
+        async with client.stream(
+            "POST", f"{backend['url']}/chat/completions", json=payload,
+            timeout=180.0,
+        ) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
 
-                    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                    if reasoning:
-                        await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if reasoning:
+                    await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
 
-                    text_piece = delta.get("content") or ""
-                    if not text_piece:
-                        continue
+                text_piece = delta.get("content") or ""
+                if not text_piece:
+                    continue
 
-                    full_response += text_piece
-                    buf += text_piece
-                    await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
+                full_response += text_piece
+                buf += text_piece
+                await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
 
-                    sentences, buf = drain_sentences(buf)
-                    for s in sentences:
-                        await tts_q.put(s)
+                sentences, buf = drain_sentences(buf)
+                for s in sentences:
+                    await tts_q.put(s)
 
         if buf.strip():
             await tts_q.put(buf.strip())

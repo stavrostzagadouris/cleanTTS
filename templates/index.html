@@ -206,8 +206,10 @@
     </section>
   </div>
 
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web/dist/bundle.min.js"></script>
+<!-- Pinned versions (the pairing recommended by the vad-web docs). Unpinned
+     jsdelivr URLs float to latest, which has broken vad-web setups before. -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
 <script>
   const $ = (id) => document.getElementById(id);
   const chat = $('chat');
@@ -637,8 +639,8 @@
     try {
       setStatus('Loading VAD model…');
       myVAD = await vad.MicVAD.new({
-        baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web/dist/',
-        onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/',
+        baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/',
+        onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
         additionalAudioConstraints: {
           echoCancellation: true,
           noiseSuppression: true,
