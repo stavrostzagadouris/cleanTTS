@@ -20,7 +20,7 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 | `GET /` | Voice assistant UI (mic → STT → LLM → TTS) |
 | `WS /ws` | WebSocket for the voice assistant pipeline |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
-| `POST /v1/audio/transcriptions` | OpenAI-compatible Whisper STT (`json` / `text` / `verbose_json`) |
+| `POST /v1/audio/transcriptions` | OpenAI-compatible STT — two engines (Whisper on CPU, Parakeet on GPU), picked per request |
 | `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote, runs on MPS) |
 | `GET /v1/voices` | Available Kokoro voices |
 | `GET /v1/models` | OpenAI-compat model list (always returns `kokoro`) |
@@ -57,6 +57,10 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 brew install ffmpeg
 ```
+
+`parakeet-mlx` in `requirements.txt` is Apple-Silicon-only (it pulls
+`mlx`/`mlx-metal`). It is optional — Whisper is the default and the server runs
+without it; drop that line on Linux/CUDA.
 
 On Apple Silicon, Kokoro runs on MPS (Apple's GPU). `faster-whisper` /
 CTranslate2 has **no** MPS backend, so Whisper transparently falls back to
@@ -316,11 +320,19 @@ low-volume, but they grow without bound; truncate them occasionally or add a
 
 ### `POST /v1/audio/transcriptions`
 
-OpenAI-compatible. Multipart `file`, optional `language` and `prompt`.
-`response_format` is `json` (default), `text`, or `verbose_json`.
+OpenAI-compatible, multipart:
+
+| field | notes |
+|---|---|
+| `file` | **required.** Anything ffmpeg can decode. |
+| `model` | Picks the checkpoint **and engine** — see below. Omit for `STT_MODEL`. |
+| `language` | e.g. `en`. Ignored by `.en` models and by Parakeet. |
+| `prompt` | Vocabulary bias. **Whisper only, and see the warning below.** |
+| `response_format` | `json` (default), `text`, `verbose_json`. |
+| `vad_filter` | Per-request override of `WHISPER_VAD_FILTER`. Whisper only. |
 
 `json` returns just `{"text": "..."}`. `verbose_json` additionally returns
-per-segment timings and the scores faster-whisper computed:
+per-segment timings and confidence scores:
 
 ```bash
 curl -X POST http://localhost:5000/v1/audio/transcriptions \
@@ -333,6 +345,47 @@ curl -X POST http://localhost:5000/v1/audio/transcriptions \
                "avg_logprob": -0.61, "no_speech_prob": 0.116,
                "compression_ratio": 1.4, "temperature": 0.0}]}
 ```
+
+### Choosing an STT engine
+
+Two engines are available on `POST /v1/audio/transcriptions`, selected by the
+`model` field. Whisper (faster-whisper/CTranslate2) has no Metal backend and
+runs on CPU; Parakeet (NVIDIA FastConformer-TDT via MLX) runs on the GPU.
+
+Measured on an M1 Max — same clips, same harness:
+
+| `model=` | 5s clip | 64-min recording | names/jargon WER |
+|---|---|---|---|
+| *omitted* → `distil-small.en` | 0.66s | ~2.1 min | 29.6% |
+| `parakeet` | **0.14s** | **~51 s** | 25.9% |
+| `turbo` | 5.15s | ~13.6 min | 14.8% |
+| `turbo` + glossary `prompt` | 5.15s | ~13.6 min | **3.7%** |
+
+Pick by the job:
+
+- **Lowest latency** — `parakeet`. It is both faster *and* slightly more
+  accurate than the default, and gives word-level timestamps. Setting
+  `STT_MODEL=parakeet` moves `/ws` onto it too: measured 0.44s earlier
+  first-audio on a voice turn.
+- **Best accuracy on names and jargon** — `turbo` with a glossary `prompt`.
+  Nothing else comes close, but it is ~36x slower than Parakeet.
+- Never `medium` (1.2x realtime); `distil-large-v3` is dominated by `turbo`.
+
+Parakeet differences that matter to clients:
+
+- **No `no_speech_prob`** — it is reported as `0.0` and means nothing. Parakeet
+  emits a native `confidence` per segment instead. Measured: hallucinated
+  output ~0.78, real speech >0.96 even at -50dB, so ~0.9 separates them.
+  `avg_logprob` is derived as `log(confidence)` for clients that threshold on it.
+- **`prompt` is ignored** — there is no `initial_prompt` equivalent. Vocabulary
+  biasing is Whisper-only.
+- **`language` is ignored** — 25 European languages with auto-detection.
+- **Word-level timestamps** are included in `verbose_json` under `words`.
+- Responses carry `"engine": "parakeet"`; Whisper responses have no `engine`
+  key, so existing clients are unaffected.
+- **It is not hallucination-proof.** It returns nothing on digital silence, but
+  on some pink-noise levels it produced `"El turismo."` at confidence 0.78.
+  Filter on `confidence`, don't assume immunity.
 
 ### The VAD pre-pass
 
@@ -528,6 +581,22 @@ string, get a waveform. All "thinking" happens in the LLM. This means:
   what to say — just POST the string to `/v1/audio/speech`. **No LLM
   required** for that path.
 
+**Three models, two devices.** On Apple Silicon the split is not obvious and
+drives most of the performance decisions here:
+
+| stage | runtime | device | why |
+|---|---|---|---|
+| Whisper STT | faster-whisper / CTranslate2 | **CPU** | no Metal backend exists |
+| Parakeet STT | parakeet-mlx / MLX | **GPU** | MLX targets Metal |
+| Kokoro TTS | PyTorch | **GPU** | MPS |
+| Diarization | pyannote / PyTorch | **GPU** | MPS |
+
+So Whisper is the only stage that cannot use the GPU, which is why bigger
+Whisper models cost so much here (`large-v3-turbo` is ~36x slower than
+Parakeet) and why Parakeet exists as an option. It also means a long
+diarization competes with Kokoro for the GPU — measured ~5x slower synthesis
+while one runs — but does not slow Whisper, which is on the other device.
+
 **Sentence-level streaming.** During the voice assistant flow, LLM tokens
 are accumulated until a sentence boundary, at which point that sentence is
 queued for TTS while the LLM keeps generating. First audio plays before the
@@ -536,6 +605,25 @@ LLM has finished thinking.
 ---
 
 ## Troubleshooting
+
+**Transcripts get much worse, and slower, when I pass `prompt`.** You are
+sending it to a distil model. `initial_prompt` biasing is a large win on
+`large-v3-turbo` (25.9% → 3.7% WER on names and jargon) and actively harmful on
+`distil-small.en`, which was not trained for prompt conditioning and degenerates
+into repetition loops at roughly 4x the latency. Send `prompt` only with
+`model=turbo`. Parakeet ignores it entirely.
+
+**`no_speech_prob` is always 0.0.** You are on the Parakeet engine (the response
+carries `"engine": "parakeet"`). Parakeet has no equivalent score; the field
+exists only so Whisper-shaped clients do not crash. Filter on the per-segment
+`confidence` instead — around 0.9 separates real speech (>0.96) from
+hallucinated output (~0.78).
+
+**The transcript invented "Thank you." out of silence.** That is Whisper
+hallucinating on non-speech, and `WHISPER_VAD_FILTER` (on by default) fixes it.
+If you turned it off, turn it back on. Parakeet is much more resistant but not
+immune — it produced `"El turismo."` on some pink noise.
+
 
 - **No mic in browser**: you're on `http://<lan-ip>:5000`. Use `localhost`
   or HTTPS.

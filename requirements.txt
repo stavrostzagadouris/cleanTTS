@@ -14,3 +14,6 @@ torch
 # torchaudio (it imports the removed AudioMetaData), and 4.x renamed
 # from_pretrained's use_auth_token kwarg to token — so the major version is pinned.
 pyannote.audio>=4,<5
+# Optional second STT engine (model=parakeet). Apple Silicon only — it pulls
+# mlx/mlx-metal. Whisper remains the default and works without this installed.
+parakeet-mlx

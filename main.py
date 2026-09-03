@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -44,6 +45,25 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
+# Names a client may send in the OpenAI `model` field that mean "whatever this
+# server is configured for" rather than naming a real checkpoint. OpenAI SDKs
+# hardcode "whisper-1", so it must not be taken literally and looked up on the
+# Hub. Anything else is passed to faster-whisper as-is — either one of its
+# built-in names (tiny, small.en, distil-small.en, large-v3-turbo, turbo, ...)
+# or a full HF repo id / local path.
+WHISPER_MODEL_ALIASES = {"", "whisper-1", "whisper", "default"}
+
+# Parakeet (NVIDIA FastConformer-TDT) via MLX. Unlike faster-whisper this runs
+# on the GPU through Metal, which is why it is ~4.6x faster than distil-small.en
+# and ~36x faster than large-v3-turbo on this hardware. Selected per request by
+# naming a model containing "parakeet"; "parakeet" alone means PARAKEET_MODEL.
+PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
+PARAKEET_ALIASES = {"parakeet", "parakeet-tdt", "parakeet-mlx"}
+
+# The model used when a request names none, and by the /ws voice pipeline.
+# Defaults to WHISPER_MODEL so existing installs are unchanged; set it to
+# "parakeet" to move the default (including /ws) onto the MLX engine.
+STT_MODEL = os.getenv("STT_MODEL", "").strip() or WHISPER_MODEL
 
 
 def _auto_device() -> str:
@@ -180,12 +200,18 @@ state: dict = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Loading Whisper: %s on %s", WHISPER_MODEL, WHISPER_DEVICE)
-    compute_type = "float16" if WHISPER_DEVICE == "cuda" else "int8"
-    state["whisper"] = WhisperModel(
-        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=compute_type
-    )
-    log.info("Whisper loaded.")
+    # Keyed by resolved model name. Only the default engine's model is loaded
+    # here, so startup cost tracks what /ws will actually use; anything else a
+    # client asks for loads lazily on first use.
+    state["whisper_models"] = {}
+    state["parakeet_models"] = {}
+    _default = resolve_whisper_model(None)
+    if is_parakeet(_default):
+        log.info("Default STT is Parakeet (%s); Whisper loads on demand.", _default)
+    else:
+        log.info("Loading Whisper: %s on %s", _default, WHISPER_DEVICE)
+        state["whisper_models"][_default] = load_whisper_model(_default)
+        log.info("Whisper loaded.")
 
     log.info("Loading Kokoro pipelines: langs=%s on %s", KOKORO_LANGS, KOKORO_DEVICE)
     state["kokoro"] = {}
@@ -420,6 +446,80 @@ def verbose_payload(segments: list, info) -> dict:
     }
 
 
+async def transcribe_parakeet(
+    audio_bytes: bytes, model_name: str
+) -> tuple[list, float]:
+    """Run Parakeet on raw audio bytes; return (sentences, duration).
+
+    Parakeet reads a file, so the bytes are staged the same way the Whisper path
+    stages them. Inference happens in a thread for the same reason: MLX releases
+    the GIL, but the surrounding work shouldn't sit on the event loop.
+    """
+    model = await get_parakeet_model(model_name)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(audio_bytes)
+        path = f.name
+    try:
+        result = await asyncio.to_thread(model.transcribe, path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    sentences = list(getattr(result, "sentences", []) or [])
+    duration = max((sn.end for sn in sentences), default=0.0)
+    return sentences, duration
+
+
+def parakeet_verbose_payload(sentences: list, duration: float, model_name: str) -> dict:
+    """Render Parakeet output in the same verbose_json shape as Whisper.
+
+    Two fields cannot be produced honestly by this engine and are documented as
+    such in docs/CLIENT-BRIEF.md:
+
+    - no_speech_prob is always 0.0. Parakeet's transducer emits nothing where
+      there is no speech, so there is no per-segment non-speech probability to
+      report. Clients must NOT treat 0.0 as "confidently speech" — use
+      `confidence` instead (measured: hallucinations ~0.78, real speech >0.96,
+      so ~0.9 separates them).
+    - avg_logprob is derived as log(confidence) so it lands in the same units
+      and direction as Whisper's, for clients that already threshold on it.
+
+    `confidence` is the native signal and the one to prefer.
+    """
+    segments = []
+    for i, sn in enumerate(sentences):
+        conf = float(getattr(sn, "confidence", 0.0) or 0.0)
+        segments.append({
+            "id": i,
+            "seek": 0,
+            "start": round(sn.start, 3),
+            "end": round(sn.end, 3),
+            "text": sn.text,
+            "tokens": [int(t.id) for t in getattr(sn, "tokens", []) if hasattr(t, "id")],
+            "temperature": 0.0,
+            "avg_logprob": math.log(conf) if conf > 0 else float("-inf"),
+            "compression_ratio": 0.0,
+            "no_speech_prob": 0.0,
+            # Native to this engine; absent from Whisper responses.
+            "confidence": round(conf, 6),
+            "words": [
+                {"start": round(t.start, 3), "end": round(t.end, 3),
+                 "word": t.text, "confidence": round(float(t.confidence), 6)}
+                for t in getattr(sn, "tokens", [])
+            ],
+        })
+    return {
+        "task": "transcribe",
+        "language": "auto",
+        "duration": round(duration, 3),
+        "text": "".join(sn.text for sn in sentences).strip(),
+        "segments": segments,
+        "engine": "parakeet",
+        "model": model_name,
+    }
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     file: UploadFile = File(...),
@@ -436,8 +536,11 @@ async def transcriptions(
     timings and scores. Anything unrecognised still falls back to the default,
     as before.
 
-    Note `model` is accepted for OpenAI compatibility but ignored — the server
-    loads WHISPER_MODEL once at startup and serves every request from it.
+    `model` selects the checkpoint per request. "whisper-1" (what OpenAI SDKs
+    send), "default" or an empty value all mean WHISPER_MODEL; anything else is
+    a faster-whisper built-in name ("large-v3-turbo", "turbo", "tiny",
+    "distil-small.en", ...) or a full HF repo id. Non-default models are loaded
+    on first use and then stay resident.
 
     vad_filter overrides WHISPER_VAD_FILTER for this request. Leave it unset
     unless you specifically want the other behaviour: with VAD off, segment
@@ -448,10 +551,38 @@ async def transcriptions(
         raise HTTPException(400, "file must not be empty.")
 
     fmt = (response_format or "json").lower()
+
+    resolved = resolve_whisper_model(model)
+
+    # Parakeet (MLX/Metal) is a separate engine selected by model name.
+    if is_parakeet(resolved):
+        try:
+            sentences, duration = await transcribe_parakeet(audio_bytes, resolved)
+        except Exception as e:
+            log.exception("Parakeet transcription failed")
+            raise HTTPException(500, f"transcription failed: {e}")
+        text = "".join(sn.text for sn in sentences).strip()
+        if fmt == "text":
+            return Response(content=text, media_type="text/plain")
+        if fmt == "verbose_json":
+            return parakeet_verbose_payload(sentences, duration, resolved)
+        return {"text": text}
+
+    # Resolve/load the model first so an unusable `model` value reports as a
+    # 400 against the request rather than a 500 against the server.
+    try:
+        await get_whisper_model(model)
+    except Exception as e:
+        log.warning("Whisper model %r could not be loaded: %s", model, e)
+        raise HTTPException(
+            400,
+            f"model {resolve_whisper_model(model)!r} could not be loaded: {e}",
+        )
+
     try:
         segments, info = await transcribe_segments(
             audio_bytes, language=language, initial_prompt=prompt,
-            vad_filter=vad_filter,
+            vad_filter=vad_filter, model=model,
         )
     except Exception as e:
         log.exception("STT transcription failed")
@@ -627,10 +758,22 @@ async def health():
     return {
         "status": "ok",
         "whisper": {
+            # "model" is the default used when a request names none; it is not
+            # the only model that can be served. Unchanged for existing clients.
             "model": WHISPER_MODEL,
             "device": WHISPER_DEVICE,
-            # Additive field; "model" and "device" are unchanged.
+            # Additive fields.
             "vad_filter": WHISPER_VAD_FILTER,
+            "loaded": sorted(state.get("whisper_models", {})),
+        },
+        # Additive: the model used when a request names none (and by /ws).
+        "stt_default": resolve_whisper_model(None),
+        # Additive: a second STT engine, selected per request via `model`.
+        # Runs on the GPU via MLX/Metal, unlike Whisper.
+        "parakeet": {
+            "model": PARAKEET_MODEL,
+            "device": "mps",
+            "loaded": sorted(state.get("parakeet_models", {})),
         },
         "kokoro": {"langs": KOKORO_LANGS, "device": KOKORO_DEVICE},
         # Additive: diarization loads lazily, so "loaded" says whether the
@@ -708,11 +851,101 @@ def drain_sentences(buf: str) -> tuple[list[str], str]:
     return sentences, buf
 
 
+def is_parakeet(name: str) -> bool:
+    """Whether a resolved model name should be served by the Parakeet engine."""
+    return "parakeet" in (name or "").lower()
+
+
+_parakeet_load_lock = asyncio.Lock()
+
+
+async def get_parakeet_model(name: str):
+    """Return the Parakeet model, loading it on first use. Same cache-first
+    pattern as Whisper: a hit never takes the lock, so a slow load can't stall
+    the /ws pipeline."""
+    models: dict = state.setdefault("parakeet_models", {})
+    cached = models.get(name)
+    if cached is not None:
+        return cached
+    async with _parakeet_load_lock:
+        cached = models.get(name)
+        if cached is not None:
+            return cached
+
+        def _load():
+            from parakeet_mlx import from_pretrained
+            return from_pretrained(name)
+
+        log.info("Loading Parakeet on demand: %s (MLX/Metal)", name)
+        model = await asyncio.to_thread(_load)
+        models[name] = model
+        log.info("Parakeet %s loaded.", name)
+        return model
+
+
+def load_whisper_model(name: str) -> WhisperModel:
+    """Instantiate one WhisperModel. Blocking — off the event loop for non-default
+    models, which may also have to download."""
+    compute_type = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+    return WhisperModel(name, device=WHISPER_DEVICE, compute_type=compute_type)
+
+
+def resolve_whisper_model(name: str | None) -> str:
+    """Map a client-supplied `model` field to a canonical checkpoint name.
+
+    Distinct spellings of the same checkpoint are collapsed so they share one
+    cache entry — faster-whisper accepts both "turbo" and "large-v3-turbo" for
+    the same 1.5GB repo, and caching it twice would just waste memory.
+    """
+    cleaned = (name or "").strip()
+    if cleaned.lower() in PARAKEET_ALIASES:
+        return PARAKEET_MODEL
+    if cleaned.lower() in WHISPER_MODEL_ALIASES:
+        cleaned = STT_MODEL
+        if cleaned.lower() in PARAKEET_ALIASES:
+            return PARAKEET_MODEL
+    try:
+        from faster_whisper.utils import _MODELS
+        return _MODELS.get(cleaned, cleaned)
+    except Exception:
+        # Private API; if it moves, fall back to the name as given.
+        return cleaned
+
+
+# Serializes loads of *new* models. Cache hits never touch it, so a slow load
+# triggered by one client can't stall the /ws pipeline on the default model.
+_whisper_load_lock = asyncio.Lock()
+
+
+async def get_whisper_model(name: str | None) -> WhisperModel:
+    """Return the requested model, loading and caching it on first use.
+
+    Models stay resident once loaded: distil-small.en is ~0.3GB and
+    large-v3-turbo ~1.5GB, so a couple of them is cheap, but nothing evicts,
+    and the set is driven by what clients ask for.
+    """
+    resolved = resolve_whisper_model(name)
+    models: dict[str, WhisperModel] = state["whisper_models"]
+    cached = models.get(resolved)
+    if cached is not None:
+        return cached
+    async with _whisper_load_lock:
+        cached = models.get(resolved)
+        if cached is not None:
+            return cached
+        log.info("Loading Whisper on demand: %s on %s", resolved, WHISPER_DEVICE)
+        model = await asyncio.to_thread(load_whisper_model, resolved)
+        models[resolved] = model
+        log.info("Whisper %s loaded (resident: %s).", resolved, ", ".join(sorted(models)))
+        return model
+
+
 async def transcribe_segments(
     audio_bytes: bytes,
     language: str | None = None,
     initial_prompt: str | None = None,
     vad_filter: bool | None = None,
+    model: str | None = None,
 ) -> tuple[list, object]:
     """Write to a temp file (so ffmpeg can decode webm/ogg/etc), run Whisper and
     return (segments, info) with every field faster-whisper produced.
@@ -723,15 +956,15 @@ async def transcribe_segments(
     the /ws pipeline sharing it.
 
     vad_filter=None uses the WHISPER_VAD_FILTER default; pass a bool to override
-    it per call.
+    it per call. model=None uses WHISPER_MODEL.
     """
     use_vad = WHISPER_VAD_FILTER if vad_filter is None else vad_filter
+    whisper = await get_whisper_model(model)
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
         f.write(audio_bytes)
         path = f.name
 
     def _run() -> tuple[list, object]:
-        whisper: WhisperModel = state["whisper"]
         segments, info = whisper.transcribe(
             path, beam_size=WHISPER_BEAM_SIZE,
             language=language, initial_prompt=initial_prompt,
@@ -753,11 +986,20 @@ async def transcribe_bytes(
     language: str | None = None,
     initial_prompt: str | None = None,
     vad_filter: bool | None = None,
+    model: str | None = None,
 ) -> str:
     """Plain-text transcription. Contract is `-> str`: this is what the /ws voice
-    pipeline and the default /v1/audio/transcriptions response use."""
+    pipeline and the default /v1/audio/transcriptions response use.
+
+    Routes to whichever engine the resolved model belongs to, so setting
+    STT_MODEL=parakeet moves the voice pipeline onto MLX with no other change.
+    """
+    resolved = resolve_whisper_model(model)
+    if is_parakeet(resolved):
+        sentences, _ = await transcribe_parakeet(audio_bytes, resolved)
+        return "".join(sn.text for sn in sentences).strip()
     segments, _ = await transcribe_segments(
-        audio_bytes, language, initial_prompt, vad_filter
+        audio_bytes, language, initial_prompt, vad_filter, model
     )
     return segments_text(segments)
 
