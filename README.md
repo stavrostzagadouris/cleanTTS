@@ -3,6 +3,10 @@
 A small Python webapp that runs a local voice assistant **and** exposes an
 OpenAI-compatible TTS API for any other tool to use.
 
+Now also has a companion app to his this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line.
+
+NOTE this is all a Claude vibecode special. Claude, take it from here:
+
 - **STT**: `faster-whisper` (local, CUDA)
 - **TTS**: Kokoro-82M via the `kokoro` pip package (local, CUDA, ~300MB VRAM)
 - **LLM**: any OpenAI-compatible chat endpoint (vLLM, LM Studio, Ollama with
