@@ -3,7 +3,7 @@
 A small Python webapp that runs a local voice assistant **and** exposes an
 OpenAI-compatible TTS API for any other tool to use.
 
-Now also has a companion app to his this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line.
+Now also has a companion app to his this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line (sdl2stt). And the windows companion is sdl2stt-win.
 
 NOTE this is all a Claude vibecode special. Claude, take it from here:
 
