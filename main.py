@@ -1,13 +1,17 @@
 import asyncio
 import base64
+import importlib.util
 import io
 import json
 import logging
 import math
 import os
+import platform
 import re
 import subprocess
+import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import httpx
@@ -97,6 +101,29 @@ else:
 # Kokoro: PyTorch-based, supports cuda/mps/cpu directly.
 _k_raw = os.getenv("KOKORO_DEVICE", "auto").lower()
 KOKORO_DEVICE = _AUTO_DEVICE if _k_raw == "auto" else _k_raw
+
+
+def _kokoro_backend() -> str:
+    """KOKORO_BACKEND=torch|mlx|auto. "mlx" is mlx-audio's port of the same
+    model onto Apple's Metal stack: on an M-series Mac it measured ~3x faster
+    than torch-on-CPU per sentence, with identical output, and without MPS's
+    ~1s per-new-input-shape penalty. "auto" picks it on Apple Silicon when
+    mlx-audio is installed, and torch everywhere else."""
+    raw = os.getenv("KOKORO_BACKEND", "auto").strip().lower()
+    if raw != "auto":
+        return raw
+    if (sys.platform == "darwin" and platform.machine() == "arm64"
+            and importlib.util.find_spec("mlx_audio") is not None):
+        return "mlx"
+    return "torch"
+
+
+KOKORO_BACKEND = _kokoro_backend()
+KOKORO_MLX_MODEL = os.getenv("KOKORO_MLX_MODEL", "mlx-community/Kokoro-82M-bf16")
+# MLX state is thread-affine (see the Parakeet note in lifespan), so every MLX
+# Kokoro call — load, warm-up, synthesis — runs on this one thread. Serializing
+# TTS costs nothing in practice: a sentence takes ~0.1s.
+KOKORO_MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kokoro-mlx")
 
 # Diarization (pyannote): plain PyTorch, so unlike Whisper it runs on MPS. On
 # Apple Silicon this is the one stage the GPU genuinely accelerates, so "auto"
@@ -207,20 +234,40 @@ async def lifespan(app: FastAPI):
     state["parakeet_models"] = {}
     _default = resolve_whisper_model(None)
     if is_parakeet(_default):
-        # NOT preloaded here: MLX state is thread-affine, and the model must be
-        # created on the same thread that runs inference (see PARAKEET_EXECUTOR).
-        # get_parakeet_model handles it on first use.
+        # NOT preloaded here: building the model on the event-loop thread and
+        # then running inference in a to_thread worker fails inside mx.eval()
+        # ("There is no Stream(cpu, 1) in current thread"). get_parakeet_model
+        # loads it inside a worker on first use, which works.
         log.info("Default STT is Parakeet (%s); loads on first use.", _default)
     else:
         log.info("Loading Whisper: %s on %s", _default, WHISPER_DEVICE)
         state["whisper_models"][_default] = load_whisper_model(_default)
         log.info("Whisper loaded.")
 
-    log.info("Loading Kokoro pipelines: langs=%s on %s", KOKORO_LANGS, KOKORO_DEVICE)
-    state["kokoro"] = {}
-    for lang in KOKORO_LANGS:
-        state["kokoro"][lang] = KPipeline(lang_code=lang, device=KOKORO_DEVICE)
+    if KOKORO_BACKEND == "mlx":
+        log.info("Loading Kokoro (MLX): %s, langs=%s", KOKORO_MLX_MODEL, KOKORO_LANGS)
+        state["kokoro"] = await asyncio.get_running_loop().run_in_executor(
+            KOKORO_MLX_EXECUTOR, load_kokoro_mlx_pipelines
+        )
+    else:
+        log.info("Loading Kokoro pipelines: langs=%s on %s", KOKORO_LANGS, KOKORO_DEVICE)
+        state["kokoro"] = {}
+        for lang in KOKORO_LANGS:
+            state["kokoro"][lang] = KPipeline(lang_code=lang, device=KOKORO_DEVICE)
     log.info("Kokoro loaded: %d pipeline(s) — %s.", len(state["kokoro"]), ",".join(KOKORO_LANGS))
+
+    # One throwaway synthesis per language so the first real request doesn't
+    # pay for voice-pack download/load and first-call setup. A failure here is
+    # only logged; the request path will surface the real error.
+    for lang in KOKORO_LANGS:
+        voice = DEFAULT_VOICE if DEFAULT_VOICE.startswith(lang) else (
+            KOKORO_VOICES_BY_LANG.get(lang) or [DEFAULT_VOICE]
+        )[0]
+        try:
+            await synthesize_async("Warming up.", voice)
+        except Exception as e:
+            log.warning("Kokoro warm-up for lang %r (%s) failed: %s", lang, voice, e)
+    log.info("Kokoro warmed up.")
 
     # One shared client for all outbound LLM traffic: keeps connections alive
     # between turns instead of a TCP handshake per request. Timeouts are set
@@ -292,7 +339,7 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
     don't pre-validate voice ids; an unknown one surfaces as Kokoro's own
     error rather than a guess here.
     """
-    pipelines: dict[str, KPipeline] = state["kokoro"]
+    pipelines: dict = state["kokoro"]
     pairs = parse_voice_spec(voice)
 
     lang = pairs[0][0][0]
@@ -305,8 +352,10 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
 
     # A single unweighted voice is passed through as its id (Kokoro handles it
     # normally). Anything else is a blend: load each voice's full embedding
-    # pack and combine into a normalized weighted-mean tensor, which the
-    # pipeline accepts directly in place of a voice id.
+    # pack and combine into a normalized weighted-mean tensor. The torch
+    # pipeline accepts that directly in place of a voice id; the MLX one only
+    # takes names, so the blend is cached in its voice table under the spec
+    # string (the cache is checked before the name is parsed) and passed by name.
     if len(pairs) == 1 and pairs[0][1] == 1.0:
         voice_arg: object = pairs[0][0]
     else:
@@ -314,9 +363,12 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
         if total <= 0:
             raise ValueError("Voice weights sum to zero; nothing to blend.")
         packs = [pipeline.load_single_voice(name) for name, _ in pairs]
-        voice_arg = torch.stack(
-            [pack * (w / total) for pack, (_, w) in zip(packs, pairs)]
-        ).sum(dim=0)
+        blend = sum(pack * (w / total) for pack, (_, w) in zip(packs, pairs))
+        if KOKORO_BACKEND == "mlx":
+            pipeline.voices[voice] = blend
+            voice_arg = voice
+        else:
+            voice_arg = blend
 
     chunks = []
     for _, _, audio in pipeline(text, voice=voice_arg, speed=speed):
@@ -324,13 +376,40 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
             audio = audio.cpu().numpy()
         elif hasattr(audio, "numpy"):
             audio = audio.numpy()
-        chunks.append(np.asarray(audio, dtype=np.float32))
+        # MLX yields (1, n) mx.arrays; np.asarray reads them via the buffer
+        # protocol, and reshape flattens both backends to 1-D.
+        chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
     if not chunks:
         return b""
     wav = np.concatenate(chunks)
     buf = io.BytesIO()
     sf.write(buf, wav, samplerate=KOKORO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return buf.getvalue()
+
+
+def load_kokoro_mlx_pipelines() -> dict:
+    """Load the MLX model and one pipeline per language. Must run on
+    KOKORO_MLX_EXECUTOR, the thread that will also run inference.
+
+    The pipelines are called directly rather than through model.generate(),
+    because generate() clears the pipeline's voice cache on every call — that
+    would re-read voice packs each sentence and drop cached blends.
+    """
+    from mlx_audio.tts.utils import load
+
+    model = load(KOKORO_MLX_MODEL)
+    # _get_pipeline is private, but it's the one place that wires a pipeline to
+    # the model's own repo/snapshot so voices load from the same weights.
+    return {lang: model._get_pipeline(lang) for lang in KOKORO_LANGS}
+
+
+async def synthesize_async(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
+    """Run synthesize() off the event loop, on the thread its backend needs."""
+    if KOKORO_BACKEND == "mlx":
+        return await asyncio.get_running_loop().run_in_executor(
+            KOKORO_MLX_EXECUTOR, synthesize, text, voice, speed
+        )
+    return await asyncio.to_thread(synthesize, text, voice, speed)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +467,7 @@ async def speech(req: SpeechRequest):
     if not req.input.strip():
         raise HTTPException(400, "input must not be empty.")
     try:
-        wav_bytes = await asyncio.to_thread(synthesize, req.input, req.voice, req.speed)
+        wav_bytes = await synthesize_async(req.input, req.voice, req.speed)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -478,7 +557,7 @@ def parakeet_verbose_payload(sentences: list, duration: float, model_name: str) 
     """Render Parakeet output in the same verbose_json shape as Whisper.
 
     Two fields cannot be produced honestly by this engine and are documented as
-    such in docs/CLIENT-BRIEF.md:
+    such in the README's Parakeet section:
 
     - no_speech_prob is always 0.0. Parakeet's transducer emits nothing where
       there is no speech, so there is no per-segment non-speech probability to
@@ -778,7 +857,14 @@ async def health():
             "device": "mps",
             "loaded": sorted(state.get("parakeet_models", {})),
         },
-        "kokoro": {"langs": KOKORO_LANGS, "device": KOKORO_DEVICE},
+        "kokoro": {
+            "langs": KOKORO_LANGS,
+            # MLX always runs on the GPU via Metal, whatever KOKORO_DEVICE says.
+            "device": "mps" if KOKORO_BACKEND == "mlx" else KOKORO_DEVICE,
+            # Additive.
+            "backend": KOKORO_BACKEND,
+            **({"model": KOKORO_MLX_MODEL} if KOKORO_BACKEND == "mlx" else {}),
+        },
         # Additive: diarization loads lazily, so "loaded" says whether the
         # first request has paid for it yet. Existing keys are untouched.
         "diarization": {
@@ -837,6 +923,26 @@ async def llm_models(backend: str | None = None):
 
 
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(\s+|$)")
+# Clause breaks usable for the *first* chunk only, so a long opening sentence
+# starts playing before the LLM reaches its full stop.
+CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:])\s+")
+# Shorter than this and the clause is so brief that prosody suffers more than
+# latency improves.
+FIRST_CHUNK_MIN_WORDS = 6
+
+
+def drain_first_clause(buf: str) -> tuple[str | None, str]:
+    """Split off a leading clause of at least FIRST_CHUNK_MIN_WORDS words at the
+    last clause break in buf; return (clause or None, leftover)."""
+    last = None
+    for m in CLAUSE_BOUNDARY.finditer(buf):
+        last = m
+    if last is None:
+        return None, buf
+    head = buf[:last.start()].strip()
+    if len(head.split()) < FIRST_CHUNK_MIN_WORDS:
+        return None, buf
+    return head, buf[last.end():]
 
 
 def drain_sentences(buf: str) -> tuple[list[str], str]:
@@ -1047,7 +1153,7 @@ async def run_pipeline(msg: dict, history: list[dict], send) -> None:
             if sentence is None:
                 return
             try:
-                wav = await asyncio.to_thread(synthesize, sentence, voice)
+                wav = await synthesize_async(sentence, voice)
                 if wav:
                     await send({
                         "type": "tts_audio",
@@ -1064,6 +1170,7 @@ async def run_pipeline(msg: dict, history: list[dict], send) -> None:
 
     try:
         buf = ""
+        queued_any = False
         client: httpx.AsyncClient = state["http"]
         payload = {
             "model": llm_model,
@@ -1108,8 +1215,13 @@ async def run_pipeline(msg: dict, history: list[dict], send) -> None:
                 await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
 
                 sentences, buf = drain_sentences(buf)
+                if not sentences and not queued_any:
+                    clause, buf = drain_first_clause(buf)
+                    if clause:
+                        sentences = [clause]
                 for s in sentences:
                     await tts_q.put(s)
+                    queued_any = True
 
         if buf.strip():
             await tts_q.put(buf.strip())

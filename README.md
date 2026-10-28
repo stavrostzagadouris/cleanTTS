@@ -62,11 +62,17 @@ python3 -m venv venv
 brew install ffmpeg
 ```
 
-`parakeet-mlx` in `requirements.txt` is Apple-Silicon-only (it pulls
-`mlx`/`mlx-metal`). It is optional — Whisper is the default and the server runs
-without it; drop that line on Linux/CUDA.
+`parakeet-mlx` and `mlx-audio` in `requirements.txt` are Apple-Silicon-only
+(they pull `mlx`/`mlx-metal`). Both are optional — drop those lines on
+Linux/CUDA. Without `parakeet-mlx`, Whisper still serves STT; without
+`mlx-audio`, Kokoro falls back to the PyTorch backend.
 
-On Apple Silicon, Kokoro runs on MPS (Apple's GPU). `faster-whisper` /
+On Apple Silicon, Kokoro runs through `mlx-audio` on Apple's GPU via Metal
+(`KOKORO_BACKEND=auto` picks it when installed). Measured on this Mac, per
+sentence: ~0.1s on MLX vs ~0.3s for PyTorch on CPU and ~1.1s for PyTorch on
+MPS. MPS is slowest because it pays ~1s for every input length it hasn't seen
+before, and a voice reply is all new sentences. If you use the PyTorch
+backend on a Mac, set `KOKORO_DEVICE=cpu`, not `mps`. `faster-whisper` /
 CTranslate2 has **no** MPS backend, so Whisper transparently falls back to
 CPU at int8 — fast enough on M-series for short utterances. If you'd
 rather force a different combo, set `WHISPER_DEVICE` and `KOKORO_DEVICE`
@@ -109,7 +115,8 @@ LLM_BACKENDS=[{"name":"5090","url":"http://100.x.y.z:1234/v1"},{"name":"3080","u
 WHISPER_MODEL=distil-large-v3                  # or 'small', 'medium', etc.
 WHISPER_DEVICE=auto                            # auto | cuda | cpu (mps not supported by faster-whisper)
 KOKORO_LANGS=a,b                               # comma-separated; one KPipeline per language
-KOKORO_DEVICE=auto                             # auto | cuda | mps | cpu
+KOKORO_BACKEND=auto                            # auto | torch | mlx (auto = mlx on Apple Silicon if installed)
+KOKORO_DEVICE=auto                             # auto | cuda | mps | cpu (torch backend only)
 DEFAULT_VOICE=af_bella
 SYSTEM_PROMPT=You are a helpful, concise voice assistant. Keep responses short and natural for speech.
 HOST=0.0.0.0
@@ -448,8 +455,9 @@ Notes:
   roughly 28x realtime, i.e. ~9s for a 4-minute recording.
 - The pipeline loads **lazily on the first request**, so it costs nothing in
   startup time or memory until used. `/health` reports whether it is loaded.
-- Kokoro also uses MPS, so a long diarization and TTS compete for the GPU:
-  synthesis slows roughly 5x while one is running. STT is unaffected (it is on
+- Kokoro also uses the GPU (MLX/Metal, or MPS on the torch backend), so a
+  long diarization and TTS compete for it. On MPS synthesis slowed roughly 5x
+  while one was running; this hasn't been re-measured on the MLX backend. STT is unaffected (it is on
   CPU) and the server stays responsive throughout.
 
 ---
@@ -592,7 +600,7 @@ drives most of the performance decisions here:
 |---|---|---|---|
 | Whisper STT | faster-whisper / CTranslate2 | **CPU** | no Metal backend exists |
 | Parakeet STT | parakeet-mlx / MLX | **GPU** | MLX targets Metal |
-| Kokoro TTS | PyTorch | **GPU** | MPS |
+| Kokoro TTS | mlx-audio / MLX | **GPU** | MLX targets Metal (PyTorch on CPU is the fallback; MPS is slower than either) |
 | Diarization | pyannote / PyTorch | **GPU** | MPS |
 
 So Whisper is the only stage that cannot use the GPU, which is why bigger

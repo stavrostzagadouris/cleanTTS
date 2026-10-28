@@ -19,3 +19,4 @@ models/
 # Local operator notes — contains this machine's Tailscale address and is
 # written for pasting into client-side sessions, not for the public repo.
 docs/CLIENT-BRIEF.md
+lmsendpoint.md

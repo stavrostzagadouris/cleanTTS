@@ -1,19 +1,27 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-httpx
-jinja2
-pydantic
-faster-whisper
-kokoro
-misaki
-soundfile
-numpy
-torch
+# Pinned to the versions verified on the Apple Silicon deployment. Bump
+# deliberately and re-test — kokoro/misaki and pyannote have broken on
+# unpinned upgrades before.
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-dotenv==1.2.2
+httpx==0.28.1
+jinja2==3.1.6
+pydantic==2.13.3
+faster-whisper==1.2.1
+kokoro==0.9.4
+misaki==0.9.4
+soundfile==0.13.1
+numpy==2.4.4
+# Floor only: the wheel comes from a platform-specific index (see README), and
+# not every exact version is published for every CUDA build.
+torch>=2.11
 # Diarization only (POST /v1/audio/diarize). pyannote 3.x is broken on current
 # torchaudio (it imports the removed AudioMetaData), and 4.x renamed
 # from_pretrained's use_auth_token kwarg to token — so the major version is pinned.
-pyannote.audio>=4,<5
+pyannote.audio==4.0.7
 # Optional second STT engine (model=parakeet). Apple Silicon only — it pulls
 # mlx/mlx-metal. Whisper remains the default and works without this installed.
-parakeet-mlx
+parakeet-mlx==0.5.2
+# Optional fast Kokoro backend (KOKORO_BACKEND=mlx, picked automatically when
+# installed). Apple Silicon only. Without it Kokoro uses the torch backend.
+mlx-audio==0.6.2
