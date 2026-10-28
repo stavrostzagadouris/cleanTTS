@@ -3,12 +3,15 @@
 A small Python webapp that runs a local voice assistant **and** exposes an
 OpenAI-compatible TTS API for any other tool to use.
 
-Now also has a companion app to his this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line (sdl2stt). And the windows companion is sdl2stt-win.
+Now also has a companion app to hit this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line (sdl2stt). And the windows companion is sdl2stt-win.
 
 NOTE this is all a Claude vibecode special. Claude, take it from here:
 
-- **STT**: `faster-whisper` (local, CUDA)
-- **TTS**: Kokoro-82M via the `kokoro` pip package (local, CUDA, ~300MB VRAM)
+- **STT**: `faster-whisper` (local; CUDA or CPU), or Parakeet via
+  `parakeet-mlx` on Apple Silicon
+- **TTS**: Kokoro-82M, via `mlx-audio` on Apple Silicon or the `kokoro` pip
+  package (PyTorch) everywhere else
+- **Diarization**: `pyannote.audio` (optional, loads on first use)
 - **LLM**: any OpenAI-compatible chat endpoint (vLLM, LM Studio, Ollama with
   OpenAI shim, OpenRouter, etc.)
 - **Web**: FastAPI + a single HTML page
@@ -24,8 +27,9 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 | `GET /` | Voice assistant UI (mic → STT → LLM → TTS) |
 | `WS /ws` | WebSocket for the voice assistant pipeline |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
+| `POST /v1/audio/speech/timed` | Same TTS, as JSON with word/sentence timings, cue markers and optional VTT/SRT subtitles |
 | `POST /v1/audio/transcriptions` | OpenAI-compatible STT — two engines (Whisper on CPU, Parakeet on GPU), picked per request |
-| `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote, runs on MPS) |
+| `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote; CUDA or MPS) |
 | `GET /v1/voices` | Available Kokoro voices |
 | `GET /v1/models` | OpenAI-compat model list (always returns `kokoro`) |
 | `GET /health` | Liveness + which models/devices are loaded |
@@ -37,7 +41,8 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 
 The Python install differs slightly per platform — pick the one that matches
 your machine. After install, the same `main.py` runs on all of them; device
-selection is handled automatically (`WHISPER_DEVICE=auto`, `KOKORO_DEVICE=auto`).
+selection is handled automatically (`WHISPER_DEVICE=auto`, `KOKORO_BACKEND=auto`,
+`KOKORO_DEVICE=auto`).
 
 ### Linux + NVIDIA (CUDA)
 
@@ -91,8 +96,9 @@ python3 -m venv venv
 Set `WHISPER_DEVICE=cpu` and `KOKORO_DEVICE=cpu` in `.env`. Expect slower
 TTS / STT than the accelerated paths, but it works for testing.
 
-> `ffmpeg` is required by Whisper (decoding the browser's WebM audio) and
-> by `/v1/audio/speech` for non-WAV response formats (opus/mp3/flac/aac).
+> `ffmpeg` is required for decoding uploaded and browser (WebM) audio for
+> STT and diarization, and for non-WAV TTS response formats
+> (opus/mp3/flac/aac/pcm).
 
 ---
 
@@ -123,6 +129,10 @@ HOST=0.0.0.0
 PORT=5000
 ```
 
+That's the common subset. `.env.example` documents every option, including
+`STT_MODEL`, `WHISPER_BEAM_SIZE`, `WHISPER_VAD_FILTER`, `KOKORO_MLX_MODEL`,
+`DIARIZE_DEVICE` and `HF_TOKEN`.
+
 The UI shows a "LLM server" dropdown; switching it refetches that backend's
 model list. The first backend in the list is the default.
 
@@ -150,8 +160,11 @@ models silently ignore unknown kwargs.
 ./venv/bin/python main.py
 ```
 
-First start: Kokoro (~300MB) and Whisper (~1.5GB for `distil-large-v3`)
+First start: the Kokoro weights (~300MB) and the default STT model (e.g.
+~1.5GB for `distil-large-v3`; Parakeet instead loads on first request)
 download from HuggingFace into the local cache. Subsequent starts are fast.
+Startup ends with one throwaway synthesis per language, so the first real
+request doesn't pay Kokoro's setup cost.
 
 ### Accessing the UI
 
@@ -184,20 +197,19 @@ this — they don't need a mic, so the LAN/Tailscale IP works fine for them.
 
 ### Python packages (Kokoro, Whisper, etc.)
 
-`requirements.txt` is intentionally unpinned, so you track the latest
-releases. To pull newer versions of everything:
+`requirements.txt` pins exact versions (torch has only a floor, because its
+wheel comes from a platform-specific index). Unpinned upgrades have broken
+this app before: pyannote 3→4, and `kokoro`/`misaki` drifting apart. So
+upgrades are deliberate. To try newer releases:
 
 ```bash
-./venv/bin/pip install -U -r requirements.txt
+./venv/bin/pip list --outdated              # see what's newer
+./venv/bin/pip install -U kokoro misaki     # upgrade specific packages
 ```
 
-The TTS model lives in the `kokoro` package (with `misaki`, its
-grapheme→phoneme companion — keep the two in sync, a version mismatch is a
-common breakage). To update just those:
-
-```bash
-./venv/bin/pip install -U kokoro misaki
-```
+Then smoke-test (below). If it works, write the new versions back into
+`requirements.txt`. Keep `kokoro` and `misaki` on matching versions; `misaki`
+is Kokoro's text→phoneme step, and `mlx-audio` uses it too.
 
 After any Kokoro/Whisper update, restart `main.py` and run a quick smoke
 test before relying on it:
@@ -208,11 +220,11 @@ curl -X POST http://localhost:5000/v1/audio/speech \
   -d '{"input":"update check","voice":"af_bella"}' --output /tmp/test.wav
 ```
 
-Almost all Kokoro updates within the `0.x` line are drop-in. The app only
-touches Kokoro through one function — `synthesize()` in `main.py` — so if a
-future release changes the `KPipeline` API or the 24 kHz sample rate, that
-one function (plus `KOKORO_SAMPLE_RATE`) is the only place you'd need to
-adjust.
+Almost all Kokoro updates within the `0.x` line are drop-in. Synthesis goes
+through one function, `render_speech()` in `main.py`, which both backends
+share; the MLX model is loaded in `load_kokoro_mlx_pipelines()`. If a future
+release changes the pipeline API or the 24 kHz sample rate, those two
+functions (plus `KOKORO_SAMPLE_RATE`) are the places to adjust.
 
 ### New voices / new languages
 
@@ -224,7 +236,8 @@ update required. To expose them:
   `KOKORO_VOICES_BY_LANG` in `main.py` (used for the `/v1/voices` listing;
   synthesis routes by the voice's first letter regardless).
 - **New language** → add its code to `KOKORO_VOICES_BY_LANG` *and* to
-  `KOKORO_LANGS` in `.env`. A new pipeline (~300 MB) loads for it at startup.
+  `KOKORO_LANGS` in `.env`. A new pipeline loads for it at startup (~300 MB
+  each on the torch backend; on MLX the languages share one model).
 
 ---
 
@@ -280,7 +293,7 @@ tail -f ~/Library/Logs/cleanTTS/stderr.log       # logs
 
 Three things that are easy to get wrong:
 
-- **Agent, not daemon.** Kokoro and pyannote need MPS, and Metal is only
+- **Agent, not daemon.** Kokoro, Parakeet and pyannote need the GPU, and Metal is only
   reachable from inside a logged-in user session. A LaunchDaemon runs in the
   system context before login and cannot use the GPU.
 - **`PATH` must be set explicitly.** launchd hands a job
@@ -427,9 +440,6 @@ real speech scores low (~0.1), while faint background speech picked up by the
 OS-level capture scores high (~0.67), so a threshold around `0.6` separates
 them. `avg_logprob` gives overall confidence.
 
-The `model` field is accepted for compatibility but ignored: the server loads
-`WHISPER_MODEL` once at startup and serves every request from it.
-
 ### `POST /v1/audio/diarize`
 
 Multipart `file`, plus optional `num_speakers` (pins the count exactly) or
@@ -457,8 +467,9 @@ Notes:
   startup time or memory until used. `/health` reports whether it is loaded.
 - Kokoro also uses the GPU (MLX/Metal, or MPS on the torch backend), so a
   long diarization and TTS compete for it. On MPS synthesis slowed roughly 5x
-  while one was running; this hasn't been re-measured on the MLX backend. STT is unaffected (it is on
-  CPU) and the server stays responsive throughout.
+  while one was running; this hasn't been re-measured on the MLX backend.
+  Whisper STT is unaffected (it is on CPU) and the server stays responsive
+  throughout.
 
 ---
 
@@ -520,6 +531,53 @@ curl -X POST http://localhost:5000/v1/audio/speech \
   --output hello.wav
 ```
 
+### Word and sentence timings — `POST /v1/audio/speech/timed`
+
+Same request body as `/v1/audio/speech`, but the response is JSON: the audio
+(base64) plus when every word and sentence is spoken. Use it to advance
+slides, show captions or highlight words in sync with the voice.
+
+The timings aren't estimates. Kokoro predicts a duration for every sound in
+order to generate the audio, and these are those durations. Checked against
+Parakeet's own word timestamps on the same audio, they agreed to within 0.08s
+on average.
+
+Put `<mark name="..."/>` anywhere in the text to get a **cue** back: the time
+the next word starts. Marks are never spoken, and the plain
+`/v1/audio/speech` route strips them too.
+
+```bash
+curl -s http://localhost:5000/v1/audio/speech/timed \
+  -H 'Content-Type: application/json' \
+  -d '{"input": "<mark name=\"title\"/>Welcome to the quarterly update. <mark name=\"slide2\"/>Revenue grew twelve percent.",
+       "voice": "bm_lewis", "subtitles": "vtt"}'
+```
+
+```jsonc
+{
+  "audio": "UklGRi...",          // base64, in response_format (default wav)
+  "format": "wav", "media_type": "audio/wav", "sample_rate": 24000,
+  "duration": 4.9,
+  "cues":      [{"name": "title", "at": 0.4}, {"name": "slide2", "at": 2.413}],
+  "sentences": [{"text": "Welcome to the quarterly update.", "start": 0.4, "end": 2.413}, ...],
+  "words":     [{"word": "Welcome", "start": 0.4, "end": 0.85}, ...],
+  "subtitles": "WEBVTT\n\n00:00:00.400 --> 00:00:02.413\nWelcome to ..."  // only if asked
+}
+```
+
+| Field | Notes |
+|---|---|
+| `subtitles` | Optional: `vtt` or `srt`, one subtitle per sentence. |
+| `response_format` | `wav`, `opus`, `flac` and `pcm` keep timings exact. `mp3`/`aac` encoders add a few tens of ms of leading padding that some players don't strip, so playback can run slightly late. |
+
+- A cue placed at the very end fires at `duration`.
+- A sentence's `end` includes the pause after it, so it equals the next
+  sentence's `start`. A word's `end` is when the word itself stops.
+- **Word timings exist for English voices only** (languages `a`/`b`). Other
+  languages return no `words`, and `sentences` falls back to Kokoro's own
+  chunks (split at line breaks and in long passages), so put one sentence
+  per line if you need sentence timings. Only English has been tested.
+
 ### Discoverability
 
 - `GET /v1/voices` — voices currently loaded on the server (depends on
@@ -546,7 +604,8 @@ prefix letter. Default is `a,b` (US + UK English).
 | `p` | Brazilian Portuguese | `pf_dora pm_alex pm_santa` | 3 |
 | `z` | Mandarin | `zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi zm_yunjian zm_yunxi zm_yunxia zm_yunyang` | 8 |
 
-Each loaded pipeline costs ~300 MB VRAM. Asking for a voice whose
+On the torch backend each loaded pipeline costs ~300 MB of (V)RAM; on MLX
+the languages share one model. Asking for a voice whose
 language isn't loaded returns `400` with a message telling you which
 code to add to `KOKORO_LANGS`.
 
@@ -593,7 +652,7 @@ string, get a waveform. All "thinking" happens in the LLM. This means:
   what to say — just POST the string to `/v1/audio/speech`. **No LLM
   required** for that path.
 
-**Three models, two devices.** On Apple Silicon the split is not obvious and
+**Four models, two devices.** On Apple Silicon the split is not obvious and
 drives most of the performance decisions here:
 
 | stage | runtime | device | why |
@@ -606,13 +665,16 @@ drives most of the performance decisions here:
 So Whisper is the only stage that cannot use the GPU, which is why bigger
 Whisper models cost so much here (`large-v3-turbo` is ~36x slower than
 Parakeet) and why Parakeet exists as an option. It also means a long
-diarization competes with Kokoro for the GPU — measured ~5x slower synthesis
-while one runs — but does not slow Whisper, which is on the other device.
+diarization competes with Kokoro for the GPU (measured ~5x slower synthesis
+on the old MPS backend while one runs) but does not slow Whisper, which is on
+the other device.
 
 **Sentence-level streaming.** During the voice assistant flow, LLM tokens
 are accumulated until a sentence boundary, at which point that sentence is
 queued for TTS while the LLM keeps generating. First audio plays before the
-LLM has finished thinking.
+LLM has finished thinking. The *first* chunk can also break at a comma,
+semicolon or colon once it has at least 6 words, so a long opening sentence
+starts playing sooner.
 
 ---
 
@@ -642,5 +704,7 @@ immune — it produced `"El turismo."` on some pink noise.
 - **CUDA OOM on the 3080**: switch `WHISPER_MODEL=small` or `tiny`.
 - **`OSError: PortAudio` / no sound**: check the browser's tab volume; the
   audio is sent as base64 WAV over the WebSocket.
-- **Kokoro voice not found**: voice ids are case-sensitive and must match
-  the configured `KOKORO_LANG` (e.g. `bf_emma` requires `KOKORO_LANG=b`).
+- **Kokoro voice not found**: voice ids are case-sensitive, and the voice's
+  language must be in `KOKORO_LANGS` (e.g. `bf_emma` requires `b`).
+- **Kokoro on MLX fails with an espeak `phontab` error**: espeak-ng can't
+  handle very long install paths. Put the venv somewhere with a shorter path.

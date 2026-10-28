@@ -323,8 +323,15 @@ def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
     return pairs
 
 
-def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
-    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz).
+def render_speech(
+    text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0
+) -> tuple[np.ndarray | None, list[dict]]:
+    """Run Kokoro; return (mono float32 audio @ 24kHz or None, chunks).
+
+    Kokoro synthesizes in chunks; each entry of `chunks` records where one
+    landed in the joined audio ({"offset", "duration", "graphemes",
+    "tokens"}). `tokens` carries Kokoro's own per-word start_ts/end_ts,
+    relative to that chunk, for English (lang a/b); other languages have none.
 
     `voice` is a spec that supports blending (see parse_voice_spec):
       - "af_bella"                      single voice
@@ -370,21 +377,185 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> byt
         else:
             voice_arg = blend
 
-    chunks = []
-    for _, _, audio in pipeline(text, voice=voice_arg, speed=speed):
+    audio_chunks = []
+    chunks: list[dict] = []
+    offset = 0
+    for result in pipeline(text, voice=voice_arg, speed=speed):
+        audio = result.audio
+        if audio is None:
+            continue
         if hasattr(audio, "cpu"):
             audio = audio.cpu().numpy()
         elif hasattr(audio, "numpy"):
             audio = audio.numpy()
         # MLX yields (1, n) mx.arrays; np.asarray reads them via the buffer
         # protocol, and reshape flattens both backends to 1-D.
-        chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
-    if not chunks:
-        return b""
-    wav = np.concatenate(chunks)
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        audio_chunks.append(audio)
+        chunks.append({
+            "offset": offset / KOKORO_SAMPLE_RATE,
+            "duration": len(audio) / KOKORO_SAMPLE_RATE,
+            "graphemes": result.graphemes,
+            "tokens": result.tokens,
+        })
+        offset += len(audio)
+    if not audio_chunks:
+        return None, []
+    return np.concatenate(audio_chunks), chunks
+
+
+def to_wav_bytes(wav: np.ndarray) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav, samplerate=KOKORO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return buf.getvalue()
+
+
+# SSML-style cue markers for /v1/audio/speech/timed: <mark name="slide2"/>.
+# Stripped before synthesis on every route so they're never read aloud.
+MARK_RE = re.compile(r"""<mark\s+name\s*=\s*["']([^"']*)["']\s*/?>""", re.IGNORECASE)
+
+
+def split_marks(text: str) -> tuple[str, list[tuple[str, int]]]:
+    """Remove <mark name="..."/> tags; return (clean text, [(name, char
+    offset into the clean text)])."""
+    parts: list[str] = []
+    marks: list[tuple[str, int]] = []
+    pos = 0
+    length = 0
+    for m in MARK_RE.finditer(text):
+        parts.append(text[pos:m.start()])
+        length += m.start() - pos
+        marks.append((m.group(1), length))
+        pos = m.end()
+    parts.append(text[pos:])
+    return "".join(parts), marks
+
+
+def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
+    """Run Kokoro and return WAV bytes (mono PCM_16 @ 24kHz); b"" if Kokoro
+    produced nothing. See render_speech for the voice spec."""
+    wav, _ = render_speech(split_marks(text)[0], voice, speed)
+    return b"" if wav is None else to_wav_bytes(wav)
+
+
+# A token that is only sentence-final punctuation closes a sentence.
+SENTENCE_END_RE = re.compile(r"^[.!?…]+$")
+WORDLIKE_RE = re.compile(r"\w")
+
+
+def timing_from_chunks(clean: str, chunks: list[dict], marks: list[tuple[str, int]]) -> dict:
+    """Build {duration, words, sentences, cues} from render_speech's chunks.
+
+    Words come straight from Kokoro's predicted durations — the times they are
+    actually spoken in this audio, not an estimate. Chunk-relative stamps are
+    shifted by each chunk's offset. Languages without word stamps fall back
+    to one "sentence" per Kokoro chunk, and their cues to chunk boundaries.
+    """
+    words: list[dict] = []
+    sentences: list[dict] = []
+    # (char offset in `clean`, start time) per timed token, for placing cues.
+    anchors: list[tuple[int, float]] = []
+    cursor = 0
+    # (text, start, end, trailing space, char span in `clean` or None)
+    pending: list[tuple[str, float, float, str, tuple[int, int] | None]] = []
+
+    def close_sentence():
+        if pending:
+            # Prefer the caller's own text: misaki normalizes some tokens
+            # (e.g. "$3.50" comes back as "3.50"), so rebuilding from tokens
+            # is only the fallback when a span couldn't be located.
+            first, last = pending[0][4], pending[-1][4]
+            if first and last:
+                text = clean[first[0]:last[1]].strip()
+            else:
+                text = "".join(t + ws for t, _, _, ws, _ in pending).strip()
+            sentences.append({
+                "text": text,
+                "start": round(pending[0][1], 3),
+                "end": round(pending[-1][2], 3),
+            })
+            pending.clear()
+
+    for ch in chunks:
+        tokens = ch["tokens"]
+        if not tokens:
+            close_sentence()
+            at = clean.find(ch["graphemes"].strip()[:20], cursor) if ch["graphemes"] else -1
+            if at >= 0:
+                anchors.append((at, ch["offset"]))
+                cursor = at
+            sentences.append({
+                "text": (ch["graphemes"] or "").strip(),
+                "start": round(ch["offset"], 3),
+                "end": round(ch["offset"] + ch["duration"], 3),
+            })
+            continue
+        for tok in tokens:
+            if tok.start_ts is None or tok.end_ts is None:
+                continue
+            start = ch["offset"] + tok.start_ts
+            end = ch["offset"] + tok.end_ts
+            # Tokens don't carry their source position, so find each one in
+            # order; misaki keeps the original spelling in tok.text.
+            at = clean.find(tok.text, cursor) if tok.text else -1
+            span = None
+            if at >= 0:
+                anchors.append((at, start))
+                cursor = at + len(tok.text)
+                span = (at, cursor)
+            if WORDLIKE_RE.search(tok.text or ""):
+                words.append({"word": tok.text, "start": round(start, 3), "end": round(end, 3)})
+            pending.append((tok.text, start, end, " " if tok.whitespace else "", span))
+            if SENTENCE_END_RE.match(tok.text or ""):
+                close_sentence()
+    close_sentence()
+
+    duration = (chunks[-1]["offset"] + chunks[-1]["duration"]) if chunks else 0.0
+    cues = []
+    for name, char_at in marks:
+        # A cue fires when the first word at or after it starts; a trailing
+        # cue fires at the end of the audio.
+        at = next((t for c, t in anchors if c >= char_at), duration)
+        cues.append({"name": name, "at": round(at, 3)})
+
+    return {
+        "duration": round(duration, 3),
+        "words": words,
+        "sentences": sentences,
+        "cues": cues,
+    }
+
+
+def synthesize_timed(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> tuple[bytes, dict]:
+    """synthesize(), plus the timing dict from timing_from_chunks."""
+    clean, marks = split_marks(text)
+    wav, chunks = render_speech(clean, voice, speed)
+    if wav is None:
+        return b"", {}
+    return to_wav_bytes(wav), timing_from_chunks(clean, chunks, marks)
+
+
+def _ts(seconds: float, sep: str) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def render_subtitles(sentences: list[dict], kind: str) -> str:
+    """One cue per sentence, as WebVTT or SRT."""
+    if kind == "vtt":
+        blocks = ["WEBVTT"] + [
+            f"{_ts(s['start'], '.')} --> {_ts(s['end'], '.')}\n{s['text']}"
+            for s in sentences
+        ]
+    else:
+        blocks = [
+            f"{i}\n{_ts(s['start'], ',')} --> {_ts(s['end'], ',')}\n{s['text']}"
+            for i, s in enumerate(sentences, 1)
+        ]
+    return "\n\n".join(blocks) + "\n"
 
 
 def load_kokoro_mlx_pipelines() -> dict:
@@ -403,13 +574,15 @@ def load_kokoro_mlx_pipelines() -> dict:
     return {lang: model._get_pipeline(lang) for lang in KOKORO_LANGS}
 
 
-async def synthesize_async(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
-    """Run synthesize() off the event loop, on the thread its backend needs."""
+async def on_tts_thread(fn, *args):
+    """Run a Kokoro call off the event loop, on the thread its backend needs."""
     if KOKORO_BACKEND == "mlx":
-        return await asyncio.get_running_loop().run_in_executor(
-            KOKORO_MLX_EXECUTOR, synthesize, text, voice, speed
-        )
-    return await asyncio.to_thread(synthesize, text, voice, speed)
+        return await asyncio.get_running_loop().run_in_executor(KOKORO_MLX_EXECUTOR, fn, *args)
+    return await asyncio.to_thread(fn, *args)
+
+
+async def synthesize_async(text: str, voice: str = DEFAULT_VOICE, speed: float = 1.0) -> bytes:
+    return await on_tts_thread(synthesize, text, voice, speed)
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +628,8 @@ class SpeechRequest(BaseModel):
     speed: float = Field(1.0, ge=0.25, le=4.0)
 
 
-@app.post("/v1/audio/speech")
-async def speech(req: SpeechRequest):
+def check_speech_request(req: SpeechRequest) -> str:
+    """Validate the fields both speech routes share; return the format."""
     fmt = req.response_format.lower()
     if fmt not in SUPPORTED_FORMATS:
         raise HTTPException(
@@ -464,31 +637,81 @@ async def speech(req: SpeechRequest):
             f"response_format '{req.response_format}' not supported. "
             f"Use one of: {', '.join(SUPPORTED_FORMATS)}.",
         )
-    if not req.input.strip():
+    if not split_marks(req.input)[0].strip():
         raise HTTPException(400, "input must not be empty.")
+    return fmt
+
+
+async def run_tts(fn, req: SpeechRequest):
+    """Run a synthesize function for a request, mapping failures to HTTP."""
     try:
-        wav_bytes = await synthesize_async(req.input, req.voice, req.speed)
+        return await on_tts_thread(fn, req.input, req.voice, req.speed)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         log.exception("TTS synthesis failed")
         raise HTTPException(500, f"TTS failed: {e}")
+
+
+async def encode_audio(wav_bytes: bytes, fmt: str) -> bytes:
     if not wav_bytes:
         raise HTTPException(500, "TTS produced no audio (Kokoro returned no chunks).")
-
-    media_type, ffmpeg_args = SUPPORTED_FORMATS[fmt]
+    ffmpeg_args = SUPPORTED_FORMATS[fmt][1]
     if ffmpeg_args is None:
-        return Response(content=wav_bytes, media_type=media_type)
-
+        return wav_bytes
     try:
-        encoded = await asyncio.to_thread(transcode, wav_bytes, ffmpeg_args)
+        return await asyncio.to_thread(transcode, wav_bytes, ffmpeg_args)
     except subprocess.CalledProcessError as e:
         log.error("ffmpeg transcode to %s failed: %s", fmt, e.stderr.decode(errors="ignore"))
         raise HTTPException(500, f"transcode to {fmt} failed")
     except FileNotFoundError:
         raise HTTPException(500, "ffmpeg not installed; required for non-WAV formats.")
 
-    return Response(content=encoded, media_type=media_type)
+
+@app.post("/v1/audio/speech")
+async def speech(req: SpeechRequest):
+    fmt = check_speech_request(req)
+    wav_bytes = await run_tts(synthesize, req)
+    encoded = await encode_audio(wav_bytes, fmt)
+    return Response(content=encoded, media_type=SUPPORTED_FORMATS[fmt][0])
+
+
+class TimedSpeechRequest(SpeechRequest):
+    subtitles: str | None = Field(
+        None, description="vtt | srt — also return subtitles, one cue per sentence."
+    )
+
+
+@app.post("/v1/audio/speech/timed")
+async def speech_timed(req: TimedSpeechRequest):
+    """Like /v1/audio/speech, but JSON: base64 audio plus when each word and
+    sentence is spoken, for syncing slides, captions or highlighting.
+
+    Put <mark name="..."/> anywhere in `input` to get a cue back with the time
+    the following word starts (or the end of the audio, for a trailing mark).
+    Marks are never spoken.
+
+    Word timings exist for English voices (lang a/b) only; other languages
+    return no words, and one sentence per Kokoro chunk. wav/opus/flac/pcm keep
+    the timings sample-exact. mp3/aac encoders add a few tens of ms of leading
+    padding that some decoders don't strip, which shifts playback slightly.
+    """
+    fmt = check_speech_request(req)
+    subs = (req.subtitles or "").lower() or None
+    if subs not in (None, "vtt", "srt"):
+        raise HTTPException(400, "subtitles must be 'vtt' or 'srt'.")
+    wav_bytes, timing = await run_tts(synthesize_timed, req)
+    encoded = await encode_audio(wav_bytes, fmt)
+    payload = {
+        "audio": base64.b64encode(encoded).decode("ascii"),
+        "format": fmt,
+        "media_type": SUPPORTED_FORMATS[fmt][0],
+        "sample_rate": KOKORO_SAMPLE_RATE,
+        **timing,
+    }
+    if subs:
+        payload["subtitles"] = render_subtitles(timing["sentences"], subs)
+    return payload
 
 
 def segments_text(segments: list) -> str:

@@ -1,5 +1,12 @@
 # Next steps — cross-platform support (CUDA / Apple Silicon)
 
+> **Status (Oct 2026): done; kept as a record of the reasoning.** Device
+> auto-detection (steps 1–4) shipped. Step 6 went a different way: instead of
+> `kokoro-onnx`, Kokoro runs on `mlx-audio` (`KOKORO_BACKEND=mlx`), measured
+> ~3x faster than PyTorch on CPU, which itself beat MPS. Step 7 was covered by
+> adding Parakeet (`parakeet-mlx`) as a second STT engine rather than
+> `mlx-whisper`. See the README for the current setup.
+
 Picking this back up later. Goal: same `main.py` runs on a CUDA box (the
 current setup) and an M1/M2/M3 Mac. No Docker. No second copy of the repo.
 
