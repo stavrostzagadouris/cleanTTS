@@ -2,7 +2,6 @@ import asyncio
 import base64
 import importlib.util
 import io
-import json
 import logging
 import math
 import os
@@ -14,15 +13,12 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
-import httpx
 import numpy as np
 import soundfile as sf
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, Response
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import Response, StreamingResponse
 from faster_whisper import WhisperModel
 from kokoro import KPipeline
 from pydantic import BaseModel, Field
@@ -35,7 +31,6 @@ log = logging.getLogger("cleanTTS")
 
 load_dotenv()
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")  # fallback only
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-large-v3")
 # beam_size=1 (greedy) is ~2x faster and near-identical quality on distil
 # models; 5 is the faster-whisper default and safest for accuracy.
@@ -64,9 +59,9 @@ WHISPER_MODEL_ALIASES = {"", "whisper-1", "whisper", "default"}
 PARAKEET_MODEL = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 PARAKEET_ALIASES = {"parakeet", "parakeet-tdt", "parakeet-mlx"}
 
-# The model used when a request names none, and by the /ws voice pipeline.
-# Defaults to WHISPER_MODEL so existing installs are unchanged; set it to
-# "parakeet" to move the default (including /ws) onto the MLX engine.
+# The model used when a request names none. Defaults to WHISPER_MODEL so
+# existing installs are unchanged; set it to "parakeet" to move the default
+# onto the MLX engine.
 STT_MODEL = os.getenv("STT_MODEL", "").strip() or WHISPER_MODEL
 
 
@@ -125,6 +120,34 @@ KOKORO_MLX_MODEL = os.getenv("KOKORO_MLX_MODEL", "mlx-community/Kokoro-82M-bf16"
 # TTS costs nothing in practice: a sentence takes ~0.1s.
 KOKORO_MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kokoro-mlx")
 
+# Qwen3-TTS: a second, optional TTS engine (mlx-audio, Apple Silicon only),
+# picked per request with model="qwen3-tts" or via /v1/audio/speech/qwen.
+# Kokoro stays the default. Loads on first use: the model needs several GB
+# while generating, which nothing should pay for unless it's asked for.
+QWEN_TTS_MODEL = os.getenv("QWEN_TTS_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+QWEN_TTS_VOICE = os.getenv("QWEN_TTS_VOICE", "ryan")
+# "auto" sends no language id at all; naming the language is what the model
+# was benchmarked with here.
+QWEN_TTS_LANGUAGE = os.getenv("QWEN_TTS_LANGUAGE", "english")
+QWEN_TTS_PRELOAD = os.getenv("QWEN_TTS_PRELOAD", "false").strip().lower() in ("1", "true", "yes", "on")
+QWEN_TTS_ALIASES = {"qwen3-tts", "qwen3_tts", "qwen-tts", "qwen"}
+# VoiceDesign: invents a voice from a text description in `instructions`. It
+# designs a NEW voice on every call, so it's for auditioning, not for a voice
+# you want to stay the same. To keep one, save a clip it made into
+# QWEN_TTS_VOICES_DIR and use it by name (cloned by the Base model).
+QWEN_TTS_DESIGN_MODEL = os.getenv(
+    "QWEN_TTS_DESIGN_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
+)
+QWEN_TTS_DESIGN_ALIASES = {"qwen3-tts-design", "qwen3_tts_design", "qwen-tts-design", "qwen-design"}
+# Base: clones a saved voice from a reference clip, identically every call.
+QWEN_TTS_BASE_MODEL = os.getenv("QWEN_TTS_BASE_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit")
+# Saved voices: <name>.wav (5-15s of speech) next to <name>.txt (its exact
+# transcript). Read per request, so a new voice works without a restart.
+QWEN_TTS_VOICES_DIR = os.getenv("QWEN_TTS_VOICES_DIR", "voices")
+# Its own MLX thread, for the same thread-affinity reason as Kokoro's. Separate
+# from Kokoro's so a long Qwen generation never queues a Kokoro request.
+QWEN_TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts")
+
 # Diarization (pyannote): plain PyTorch, so unlike Whisper it runs on MPS. On
 # Apple Silicon this is the one stage the GPU genuinely accelerates, so "auto"
 # is left at the raw auto-detect (no CPU downgrade).
@@ -147,56 +170,11 @@ def _parse_langs() -> list[str]:
 
 KOKORO_LANGS = _parse_langs()
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "af_bella")
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "You are a helpful, concise voice assistant. Replies are spoken aloud, so keep them "
-    "short and natural for speech (no markdown, no bullet lists, no headers). Input is "
-    "transcribed from the user's voice and may contain occasional mis-heard words or odd "
-    "artifacts — if something looks like a transcription glitch, infer what they likely "
-    "meant when context makes it obvious, otherwise ask a brief clarifying question "
-    "rather than answering the literal nonsense.",
-)
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
 
 KOKORO_SAMPLE_RATE = 24000
 
-
-def _parse_backends() -> list[dict]:
-    raw = os.getenv("LLM_BACKENDS", "").strip()
-    if raw:
-        try:
-            data = json.loads(raw)
-            out = []
-            for item in data:
-                if isinstance(item, dict) and item.get("name") and item.get("url"):
-                    backend = {
-                        "name": str(item["name"]),
-                        "url": str(item["url"]).rstrip("/"),
-                    }
-                    # Optional: chat_template_kwargs forwarded into each
-                    # /v1/chat/completions request for this backend. Use this to
-                    # disable thinking on Qwen3 ({"enable_thinking": false}), etc.
-                    ctk = item.get("chat_template_kwargs")
-                    if isinstance(ctk, dict):
-                        backend["chat_template_kwargs"] = ctk
-                    out.append(backend)
-            if out:
-                return out
-        except json.JSONDecodeError as e:
-            log.warning("LLM_BACKENDS JSON could not be parsed: %s", e)
-    return [{"name": "default", "url": LLM_BASE_URL.rstrip("/")}]
-
-
-LLM_BACKENDS = _parse_backends()
-
-
-def _find_backend(name: str | None) -> dict:
-    if name:
-        for b in LLM_BACKENDS:
-            if b["name"] == name:
-                return b
-    return LLM_BACKENDS[0]
 
 # Full Kokoro v1 voice catalog, keyed by lang_code. Source: hexgrad/Kokoro-82M.
 # Only the entries listed in KOKORO_LANGS get loaded into VRAM at startup.
@@ -228,7 +206,7 @@ state: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Keyed by resolved model name. Only the default engine's model is loaded
-    # here, so startup cost tracks what /ws will actually use; anything else a
+    # here, so startup cost tracks what default requests use; anything else a
     # client asks for loads lazily on first use.
     state["whisper_models"] = {}
     state["parakeet_models"] = {}
@@ -269,20 +247,16 @@ async def lifespan(app: FastAPI):
             log.warning("Kokoro warm-up for lang %r (%s) failed: %s", lang, voice, e)
     log.info("Kokoro warmed up.")
 
-    # One shared client for all outbound LLM traffic: keeps connections alive
-    # between turns instead of a TCP handshake per request. Timeouts are set
-    # per-request at the call sites.
-    state["http"] = httpx.AsyncClient()
+    if QWEN_TTS_PRELOAD:
+        for repo in (QWEN_TTS_MODEL, QWEN_TTS_BASE_MODEL, QWEN_TTS_DESIGN_MODEL):
+            await asyncio.get_running_loop().run_in_executor(QWEN_TTS_EXECUTOR, qwen_tts_model, repo)
 
     yield
 
-    await state["http"].aclose()
     state.clear()
 
 
 app = FastAPI(title="cleanTTS", version="0.1.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
 
 
 def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
@@ -404,9 +378,9 @@ def render_speech(
     return np.concatenate(audio_chunks), chunks
 
 
-def to_wav_bytes(wav: np.ndarray) -> bytes:
+def to_wav_bytes(wav: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RATE) -> bytes:
     buf = io.BytesIO()
-    sf.write(buf, wav, samplerate=KOKORO_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    sf.write(buf, wav, samplerate=sample_rate, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
 
@@ -614,7 +588,7 @@ def transcode(wav_bytes: bytes, ffmpeg_args: list[str]) -> bytes:
 
 class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize.")
-    model: str = Field("kokoro", description="Ignored; we always use Kokoro-82M.")
+    model: str = Field("kokoro", description="kokoro (default), qwen3-tts or qwen3-tts-design.")
     voice: str = Field(
         DEFAULT_VOICE,
         description=(
@@ -626,6 +600,17 @@ class SpeechRequest(BaseModel):
     )
     response_format: str = Field("wav", description="wav | opus | mp3 | flac | aac | pcm")
     speed: float = Field(1.0, ge=0.25, le=4.0)
+    # Additive, Qwen3-TTS only; Kokoro ignores both.
+    instructions: str | None = Field(
+        None,
+        description="Qwen3-TTS: speaking style/emotion for preset voices, e.g. "
+        "'Calm and warm.' (1.7B models only; saved voices ignore it). For "
+        "qwen3-tts-design, the description of the voice to invent.",
+    )
+    stream: bool = Field(
+        False,
+        description="Qwen3-TTS: stream audio as it is generated (wav or pcm only).",
+    )
 
 
 def check_speech_request(req: SpeechRequest) -> str:
@@ -671,9 +656,170 @@ async def encode_audio(wav_bytes: bytes, fmt: str) -> bytes:
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest):
     fmt = check_speech_request(req)
+    if req.model.strip().lower() in QWEN_TTS_ALIASES | QWEN_TTS_DESIGN_ALIASES:
+        return await speak_qwen(req, fmt)
     wav_bytes = await run_tts(synthesize, req)
     encoded = await encode_audio(wav_bytes, fmt)
     return Response(content=encoded, media_type=SUPPORTED_FORMATS[fmt][0])
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-TTS
+# ---------------------------------------------------------------------------
+
+def qwen_tts_model(repo: str = QWEN_TTS_MODEL):
+    """Return a Qwen3-TTS model, loading it on first call. Must run on
+    QWEN_TTS_EXECUTOR — its single thread is also what serializes loads."""
+    models: dict = state.setdefault("qwen_tts", {})
+    model = models.get(repo)
+    if model is None:
+        from mlx_audio.tts.utils import load
+
+        log.info("Loading Qwen3-TTS: %s (MLX/Metal)", repo)
+        model = load(repo)
+        models[repo] = model
+        log.info("Qwen3-TTS %s loaded.", repo)
+    return model
+
+
+def qwen_saved_voices() -> dict[str, tuple[str, str]]:
+    """Saved voices in QWEN_TTS_VOICES_DIR: name -> (wav path, transcript).
+    Only names found on disk are ever used as paths."""
+    voices = {}
+    try:
+        names = os.listdir(QWEN_TTS_VOICES_DIR)
+    except FileNotFoundError:
+        return voices
+    for fname in names:
+        stem, ext = os.path.splitext(fname)
+        txt = os.path.join(QWEN_TTS_VOICES_DIR, stem + ".txt")
+        if ext.lower() == ".wav" and os.path.exists(txt):
+            with open(txt) as f:
+                voices[stem.lower()] = (os.path.join(QWEN_TTS_VOICES_DIR, fname), f.read().strip())
+    return voices
+
+
+def resolve_qwen(req: SpeechRequest) -> tuple[str, dict]:
+    """Pick the Qwen model and generate() kwargs for a request:
+    model=qwen3-tts-design -> VoiceDesign, described by `instructions`;
+    a saved voice name    -> Base, cloning that voice's clip;
+    anything else         -> CustomVoice preset speaker (+ `instructions` style)."""
+    if req.model.strip().lower() in QWEN_TTS_DESIGN_ALIASES:
+        # mlx-audio raises its own ValueError (-> 400) if instructions is empty.
+        return QWEN_TTS_DESIGN_MODEL, {"instruct": req.instructions}
+    # A client that didn't pick a voice gets Qwen's default, not Kokoro's.
+    voice = req.voice if "voice" in req.model_fields_set else QWEN_TTS_VOICE
+    saved = qwen_saved_voices().get(voice.strip().lower())
+    if saved:
+        return QWEN_TTS_BASE_MODEL, {"ref_audio": saved[0], "ref_text": saved[1]}
+    kwargs = {"voice": voice}
+    if req.instructions:
+        kwargs["instruct"] = req.instructions
+    return QWEN_TTS_MODEL, kwargs
+
+
+def qwen_generate(repo: str, text: str, kwargs: dict, stream: bool):
+    """Yield float32 audio chunks from Qwen3-TTS. Unknown preset voices raise
+    ValueError from mlx-audio itself, listing the valid ones."""
+    model = qwen_tts_model(repo)
+    kwargs = dict(kwargs, text=split_marks(text)[0], lang_code=QWEN_TTS_LANGUAGE)
+    if stream:
+        # ~6 codec frames at 12.5Hz: first audio in ~0.25s on an M-series Mac.
+        kwargs.update(stream=True, streaming_interval=0.48)
+    for result in model.generate(**kwargs):
+        if result.audio is not None:
+            yield np.asarray(result.audio, dtype=np.float32).reshape(-1)
+
+
+def synthesize_qwen(repo: str, text: str, kwargs: dict) -> bytes:
+    """Run Qwen3-TTS to completion; return WAV bytes, or b"" if it produced nothing."""
+    chunks = list(qwen_generate(repo, text, kwargs, False))
+    if not chunks:
+        return b""
+    return to_wav_bytes(np.concatenate(chunks), state["qwen_tts"][repo].sample_rate)
+
+
+def streaming_wav_header(sample_rate: int) -> bytes:
+    """A PCM_16 mono WAV header for a stream of unknown length: the size fields
+    are set to the maximum, which players read as "until the data ends"."""
+    unknown = 0xFFFFFFFF
+    return (
+        b"RIFF" + unknown.to_bytes(4, "little") + b"WAVEfmt "
+        + (16).to_bytes(4, "little") + (1).to_bytes(2, "little") + (1).to_bytes(2, "little")
+        + sample_rate.to_bytes(4, "little") + (sample_rate * 2).to_bytes(4, "little")
+        + (2).to_bytes(2, "little") + (16).to_bytes(2, "little")
+        + b"data" + unknown.to_bytes(4, "little")
+    )
+
+
+async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> StreamingResponse:
+    """Stream Qwen3-TTS audio as it's generated. The first chunk is pulled
+    before responding, so a bad voice still becomes a 400 rather than a
+    truncated 200."""
+    loop = asyncio.get_running_loop()
+    gen = qwen_generate(repo, req.input, kwargs, True)
+    done = object()
+
+    def next_chunk():
+        return next(gen, done)
+
+    try:
+        first = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("Qwen3-TTS synthesis failed")
+        raise HTTPException(500, f"TTS failed: {e}")
+    if first is done:
+        raise HTTPException(500, "TTS produced no audio (Qwen3-TTS returned no chunks).")
+    sample_rate = state["qwen_tts"][repo].sample_rate
+
+    def pcm16(chunk: np.ndarray) -> bytes:
+        return (np.clip(chunk, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+    async def body():
+        # One chunk per executor hop, so a client that disconnects stops
+        # generation at the next chunk instead of holding the thread.
+        try:
+            if fmt == "wav":
+                yield streaming_wav_header(sample_rate)
+            chunk = first
+            while chunk is not done:
+                yield pcm16(chunk)
+                chunk = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+        finally:
+            await loop.run_in_executor(QWEN_TTS_EXECUTOR, gen.close)
+
+    return StreamingResponse(body(), media_type=SUPPORTED_FORMATS[fmt][0])
+
+
+async def speak_qwen(req: SpeechRequest, fmt: str) -> Response:
+    repo, kwargs = resolve_qwen(req)
+    if req.stream:
+        if fmt not in ("wav", "pcm"):
+            raise HTTPException(400, "stream=true supports response_format wav or pcm only.")
+        return await stream_qwen(req, repo, kwargs, fmt)
+    loop = asyncio.get_running_loop()
+    try:
+        wav_bytes = await loop.run_in_executor(
+            QWEN_TTS_EXECUTOR, synthesize_qwen, repo, req.input, kwargs
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("Qwen3-TTS synthesis failed")
+        raise HTTPException(500, f"TTS failed: {e}")
+    encoded = await encode_audio(wav_bytes, fmt)
+    return Response(content=encoded, media_type=SUPPORTED_FORMATS[fmt][0])
+
+
+@app.post("/v1/audio/speech/qwen")
+async def speech_qwen(req: SpeechRequest):
+    """Same as /v1/audio/speech with model="qwen3-tts" (or qwen3-tts-design,
+    if that's what `model` says)."""
+    if req.model.strip().lower() not in QWEN_TTS_DESIGN_ALIASES:
+        req.model = "qwen3-tts"
+    return await speak_qwen(req, check_speech_request(req))
 
 
 class TimedSpeechRequest(SpeechRequest):
@@ -715,7 +861,7 @@ async def speech_timed(req: TimedSpeechRequest):
 
 
 def segments_text(segments: list) -> str:
-    """Join Whisper segments into one transcript, as the /ws pipeline expects."""
+    """Join Whisper segments into one plain-text transcript."""
     return "".join(s.text for s in segments).strip()
 
 
@@ -909,8 +1055,8 @@ async def transcriptions(
 DIARIZE_SAMPLE_RATE = 16000
 
 # Serializes the one-time lazy load so two simultaneous first requests don't
-# both pull the model. Deliberately NOT shared with the Whisper path — the /ws
-# voice pipeline never waits on this.
+# both pull the model. Deliberately NOT shared with the Whisper path — plain
+# transcription requests never wait on this.
 _diarize_load_lock = asyncio.Lock()
 
 
@@ -1071,7 +1217,7 @@ async def health():
             "vad_filter": WHISPER_VAD_FILTER,
             "loaded": sorted(state.get("whisper_models", {})),
         },
-        # Additive: the model used when a request names none (and by /ws).
+        # Additive: the model used when a request names none .
         "stt_default": resolve_whisper_model(None),
         # Additive: a second STT engine, selected per request via `model`.
         # Runs on the GPU via MLX/Metal, unlike Whisper.
@@ -1088,6 +1234,16 @@ async def health():
             "backend": KOKORO_BACKEND,
             **({"model": KOKORO_MLX_MODEL} if KOKORO_BACKEND == "mlx" else {}),
         },
+        # Additive: optional second TTS engine, loaded on first use.
+        "qwen_tts": {
+            "model": QWEN_TTS_MODEL,
+            "voice": QWEN_TTS_VOICE,
+            "device": "mps",
+            "design_model": QWEN_TTS_DESIGN_MODEL,
+            "base_model": QWEN_TTS_BASE_MODEL,
+            "saved_voices": sorted(qwen_saved_voices()),
+            "loaded": sorted(state.get("qwen_tts", {})),
+        },
         # Additive: diarization loads lazily, so "loaded" says whether the
         # first request has paid for it yet. Existing keys are untouched.
         "diarization": {
@@ -1102,85 +1258,28 @@ async def health():
 async def list_models():
     return {
         "object": "list",
-        "data": [{"id": "kokoro", "object": "model", "owned_by": "hexgrad"}],
+        "data": [
+            {"id": "kokoro", "object": "model", "owned_by": "hexgrad"},
+            {"id": "qwen3-tts", "object": "model", "owned_by": "qwen"},
+            {"id": "qwen3-tts-design", "object": "model", "owned_by": "qwen"},
+        ],
     }
 
 
 @app.get("/v1/voices")
-async def list_voices():
+async def list_voices(model: str | None = None):
+    if (model or "").strip().lower() in QWEN_TTS_ALIASES:
+        qwen = await asyncio.get_running_loop().run_in_executor(QWEN_TTS_EXECUTOR, qwen_tts_model)
+        return {
+            "voices": qwen.get_supported_speakers(),
+            # Additive: cloned voices from QWEN_TTS_VOICES_DIR, same `voice` field.
+            "saved_voices": sorted(qwen_saved_voices()),
+            "default": QWEN_TTS_VOICE,
+        }
     voices: list[str] = []
     for lang in KOKORO_LANGS:
         voices.extend(KOKORO_VOICES_BY_LANG.get(lang, []))
     return {"voices": voices, "default": DEFAULT_VOICE, "langs": KOKORO_LANGS}
-
-
-# ---------------------------------------------------------------------------
-# Voice assistant: UI + WebSocket pipeline
-# ---------------------------------------------------------------------------
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
-
-
-@app.get("/api/llm-backends")
-async def llm_backends():
-    return {
-        "backends": [{"name": b["name"]} for b in LLM_BACKENDS],
-        "default": LLM_BACKENDS[0]["name"],
-    }
-
-
-@app.get("/api/llm-models")
-async def llm_models(backend: str | None = None):
-    b = _find_backend(backend)
-    try:
-        client: httpx.AsyncClient = state["http"]
-        r = await client.get(f"{b['url']}/models", timeout=5.0)
-        r.raise_for_status()
-        data = r.json()
-        return {"models": [m["id"] for m in data.get("data", [])], "backend": b["name"]}
-    except Exception as e:
-        log.warning("LLM model list failed (%s): %s", b["name"], e)
-        return {"models": [], "backend": b["name"], "error": str(e)}
-
-
-SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(\s+|$)")
-# Clause breaks usable for the *first* chunk only, so a long opening sentence
-# starts playing before the LLM reaches its full stop.
-CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:])\s+")
-# Shorter than this and the clause is so brief that prosody suffers more than
-# latency improves.
-FIRST_CHUNK_MIN_WORDS = 6
-
-
-def drain_first_clause(buf: str) -> tuple[str | None, str]:
-    """Split off a leading clause of at least FIRST_CHUNK_MIN_WORDS words at the
-    last clause break in buf; return (clause or None, leftover)."""
-    last = None
-    for m in CLAUSE_BOUNDARY.finditer(buf):
-        last = m
-    if last is None:
-        return None, buf
-    head = buf[:last.start()].strip()
-    if len(head.split()) < FIRST_CHUNK_MIN_WORDS:
-        return None, buf
-    return head, buf[last.end():]
-
-
-def drain_sentences(buf: str) -> tuple[list[str], str]:
-    """Pull complete sentences from buf; return (sentences, leftover)."""
-    sentences: list[str] = []
-    while True:
-        m = SENTENCE_BOUNDARY.search(buf)
-        if not m:
-            break
-        end = m.end()
-        s = buf[:end].strip()
-        if s:
-            sentences.append(s)
-        buf = buf[end:]
-    return sentences, buf
 
 
 def is_parakeet(name: str) -> bool:
@@ -1194,7 +1293,7 @@ _parakeet_load_lock = asyncio.Lock()
 async def get_parakeet_model(name: str):
     """Return the Parakeet model, loading it on first use. Same cache-first
     pattern as Whisper: a hit never takes the lock, so a slow load can't stall
-    the /ws pipeline."""
+    requests on an already-loaded model."""
     models: dict = state.setdefault("parakeet_models", {})
     cached = models.get(name)
     if cached is not None:
@@ -1245,7 +1344,7 @@ def resolve_whisper_model(name: str | None) -> str:
 
 
 # Serializes loads of *new* models. Cache hits never touch it, so a slow load
-# triggered by one client can't stall the /ws pipeline on the default model.
+# triggered by one client can't stall requests on the default model.
 _whisper_load_lock = asyncio.Lock()
 
 
@@ -1285,7 +1384,7 @@ async def transcribe_segments(
     faster-whisper's `transcribe()` only *builds* a lazy generator; the actual
     decode happens while iterating it. So the iteration is drained inside the
     same to_thread call — otherwise the decode runs on the event loop and stalls
-    the /ws pipeline sharing it.
+    every other request sharing it.
 
     vad_filter=None uses the WHISPER_VAD_FILTER default; pass a bool to override
     it per call. model=None uses WHISPER_MODEL.
@@ -1320,11 +1419,11 @@ async def transcribe_bytes(
     vad_filter: bool | None = None,
     model: str | None = None,
 ) -> str:
-    """Plain-text transcription. Contract is `-> str`: this is what the /ws voice
-    pipeline and the default /v1/audio/transcriptions response use.
+    """Plain-text transcription. Contract is `-> str`: this is what the default
+    /v1/audio/transcriptions response uses.
 
     Routes to whichever engine the resolved model belongs to, so setting
-    STT_MODEL=parakeet moves the voice pipeline onto MLX with no other change.
+    STT_MODEL=parakeet moves default requests onto MLX with no other change.
     """
     resolved = resolve_whisper_model(model)
     if is_parakeet(resolved):
@@ -1334,212 +1433,6 @@ async def transcribe_bytes(
         audio_bytes, language, initial_prompt, vad_filter, model
     )
     return segments_text(segments)
-
-
-async def run_pipeline(msg: dict, history: list[dict], send) -> None:
-    """One full STT → LLM → TTS turn. Cancellable: on CancelledError we save
-    whatever assistant text we already streamed to history, then re-raise."""
-    voice = msg.get("voice") or DEFAULT_VOICE
-    llm_model = msg.get("llm_model")
-    backend = _find_backend(msg.get("llm_backend"))
-
-    if not llm_model:
-        await send({"type": "error", "message": "Pick an LLM model first."})
-        return
-
-    # 1. STT
-    try:
-        audio_bytes = base64.b64decode(msg["audio"])
-        transcription = await transcribe_bytes(audio_bytes)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.exception("Whisper failed")
-        await send({"type": "error", "message": f"Whisper failed: {e}"})
-        return
-
-    if not transcription:
-        await send({"type": "transcription", "text": "(no speech detected)"})
-        await send({"type": "llm_done"})
-        return
-
-    await send({"type": "transcription", "text": transcription})
-    history.append({"role": "user", "content": transcription})
-
-    # 2. LLM stream + sentence-chunked TTS
-    tts_q: asyncio.Queue = asyncio.Queue()
-    full_response = ""
-
-    async def tts_worker():
-        while True:
-            sentence = await tts_q.get()
-            if sentence is None:
-                return
-            try:
-                wav = await synthesize_async(sentence, voice)
-                if wav:
-                    await send({
-                        "type": "tts_audio",
-                        "audio": base64.b64encode(wav).decode("ascii"),
-                    })
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                log.exception("TTS chunk failed")
-                await send({"type": "error", "message": f"TTS chunk failed: {e}"})
-
-    tts_task = asyncio.create_task(tts_worker())
-    cancelled = False
-
-    try:
-        buf = ""
-        queued_any = False
-        client: httpx.AsyncClient = state["http"]
-        payload = {
-            "model": llm_model,
-            "messages": history,
-            "stream": True,
-            "temperature": 0.7,
-            "max_tokens": 1024,
-        }
-        if backend.get("chat_template_kwargs"):
-            payload["chat_template_kwargs"] = backend["chat_template_kwargs"]
-        async with client.stream(
-            "POST", f"{backend['url']}/chat/completions", json=payload,
-            timeout=180.0,
-        ) as r:
-            r.raise_for_status()
-            async for line in r.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                chunk = line[5:].strip()
-                if chunk == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(chunk)
-                except json.JSONDecodeError:
-                    continue
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-
-                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                if reasoning:
-                    await send({"type": "llm_chunk", "text": reasoning, "is_reasoning": True})
-
-                text_piece = delta.get("content") or ""
-                if not text_piece:
-                    continue
-
-                full_response += text_piece
-                buf += text_piece
-                await send({"type": "llm_chunk", "text": text_piece, "is_reasoning": False})
-
-                sentences, buf = drain_sentences(buf)
-                if not sentences and not queued_any:
-                    clause, buf = drain_first_clause(buf)
-                    if clause:
-                        sentences = [clause]
-                for s in sentences:
-                    await tts_q.put(s)
-                    queued_any = True
-
-        if buf.strip():
-            await tts_q.put(buf.strip())
-    except asyncio.CancelledError:
-        cancelled = True
-        log.info("Pipeline cancelled (barge-in or new turn)")
-        raise
-    except Exception as e:
-        log.exception("LLM call failed")
-        try:
-            await send({"type": "error", "message": f"LLM call failed: {e}"})
-        except Exception:
-            pass
-    finally:
-        # Always shut down the TTS worker so we don't leak tasks
-        await tts_q.put(None)
-        try:
-            await asyncio.wait_for(asyncio.shield(tts_task), timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            tts_task.cancel()
-
-        # Save whatever assistant text we generated (full or partial) so the
-        # LLM remembers what it had said before being interrupted.
-        if full_response.strip():
-            history.append({"role": "assistant", "content": full_response.strip()})
-
-        if cancelled:
-            try:
-                await send({"type": "cancelled"})
-            except Exception:
-                pass
-        else:
-            try:
-                await send({"type": "llm_done"})
-            except Exception:
-                pass
-
-
-async def _cancel_and_wait(task: asyncio.Task | None) -> None:
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except (asyncio.CancelledError, Exception):
-        pass
-
-
-@app.websocket("/ws")
-async def ws(socket: WebSocket):
-    await socket.accept()
-    log.info("WS connected")
-    history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    pipeline_task: asyncio.Task | None = None
-
-    async def send(payload: dict):
-        await socket.send_text(json.dumps(payload))
-
-    try:
-        while True:
-            raw = await socket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            mtype = msg.get("type")
-
-            if mtype == "reset":
-                await _cancel_and_wait(pipeline_task)
-                history = [{"role": "system", "content": SYSTEM_PROMPT}]
-                await send({"type": "reset_ack"})
-                continue
-
-            if mtype == "cancel":
-                await _cancel_and_wait(pipeline_task)
-                continue
-
-            if "audio" not in msg:
-                continue
-
-            # New turn: cancel any in-flight pipeline (barge-in or just sequential turns).
-            await _cancel_and_wait(pipeline_task)
-            pipeline_task = asyncio.create_task(run_pipeline(msg, history, send))
-
-    except WebSocketDisconnect:
-        log.info("WS disconnected")
-    except Exception:
-        log.exception("WS handler error")
-        try:
-            await socket.send_text(json.dumps({"type": "error", "message": "Server error; see logs."}))
-        except Exception:
-            pass
-    finally:
-        await _cancel_and_wait(pipeline_task)
 
 
 if __name__ == "__main__":

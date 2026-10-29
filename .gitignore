@@ -20,3 +20,6 @@ models/
 # written for pasting into client-side sessions, not for the public repo.
 docs/CLIENT-BRIEF.md
 lmsendpoint.md
+
+# Saved Qwen3-TTS voices are clones of real people: kept local, never published.
+voices/

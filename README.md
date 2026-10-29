@@ -1,7 +1,7 @@
 # cleanTTS
 
-A small Python webapp that runs a local voice assistant **and** exposes an
-OpenAI-compatible TTS API for any other tool to use.
+A small Python service that exposes OpenAI-compatible TTS and STT APIs for
+any other tool to use.
 
 Now also has a companion app to hit this endpoint from linux when holding a hotkey (super + space) to talk straight to your text line (sdl2stt). And the windows companion is sdl2stt-win.
 
@@ -10,11 +10,10 @@ NOTE this is all a Claude vibecode special. Claude, take it from here:
 - **STT**: `faster-whisper` (local; CUDA or CPU), or Parakeet via
   `parakeet-mlx` on Apple Silicon
 - **TTS**: Kokoro-82M, via `mlx-audio` on Apple Silicon or the `kokoro` pip
-  package (PyTorch) everywhere else
+  package (PyTorch) everywhere else; optionally Qwen3-TTS via `mlx-audio`
+  (Apple Silicon only)
 - **Diarization**: `pyannote.audio` (optional, loads on first use)
-- **LLM**: any OpenAI-compatible chat endpoint (vLLM, LM Studio, Ollama with
-  OpenAI shim, OpenRouter, etc.)
-- **Web**: FastAPI + a single HTML page
+- **Web**: FastAPI
 
 One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 
@@ -24,16 +23,27 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /` | Voice assistant UI (mic → STT → LLM → TTS) |
-| `WS /ws` | WebSocket for the voice assistant pipeline |
 | `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
+| `POST /v1/audio/speech/qwen` | Same TTS on Qwen3-TTS instead of Kokoro (or send `model: "qwen3-tts"` to `/v1/audio/speech`) — see [Qwen3-TTS](#qwen3-tts-second-tts-engine) |
 | `POST /v1/audio/speech/timed` | Same TTS, as JSON with word/sentence timings, cue markers and optional VTT/SRT subtitles |
 | `POST /v1/audio/transcriptions` | OpenAI-compatible STT — two engines (Whisper on CPU, Parakeet on GPU), picked per request |
 | `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote; CUDA or MPS) |
-| `GET /v1/voices` | Available Kokoro voices |
-| `GET /v1/models` | OpenAI-compat model list (always returns `kokoro`) |
+| `GET /v1/voices` | Available Kokoro voices (`?model=qwen3-tts` for Qwen's preset and saved voices) |
+| `GET /v1/models` | OpenAI-compat model list (`kokoro`, `qwen3-tts`, `qwen3-tts-design`) |
 | `GET /health` | Liveness + which models/devices are loaded |
-| `GET /api/llm-models` | Discovery for the configured LLM backend |
+
+### Changes on 2026-10-29
+
+- **Removed: the browser voice assistant.** The `GET /` page, the `WS /ws`
+  pipeline, `GET /api/llm-backends` / `GET /api/llm-models`, and the
+  `LLM_BACKENDS`, `LLM_BASE_URL` and `SYSTEM_PROMPT` settings are gone, along
+  with the `templates/` page and the `httpx`/`jinja2` dependencies. cleanTTS no
+  longer talks to any LLM; clients (e.g. an agent) decide what to say and call
+  the REST routes. Every REST route above is unchanged.
+- **Added: Qwen3-TTS** as an opt-in second TTS engine, with preset voices,
+  style `instructions`, streaming, voice design, and saved voices cloned from a
+  reference clip. Kokoro stays the default. See
+  [Qwen3-TTS](#qwen3-tts-second-tts-engine).
 
 ---
 
@@ -111,46 +121,20 @@ cp .env.example .env
 ```
 
 ```env
-# JSON list of LLM backends. Each entry needs a name (shown in the UI dropdown)
-# and a URL pointing at any OpenAI-compatible /v1 endpoint (vLLM, LM Studio, Ollama, etc.).
-LLM_BACKENDS=[{"name":"5090","url":"http://100.x.y.z:1234/v1"},{"name":"3080","url":"http://100.x.y.z:1234/v1"}]
-
-# Single-backend fallback (used only if LLM_BACKENDS is unset or invalid)
-# LLM_BASE_URL=http://100.x.y.z:1234/v1
-
 WHISPER_MODEL=distil-large-v3                  # or 'small', 'medium', etc.
 WHISPER_DEVICE=auto                            # auto | cuda | cpu (mps not supported by faster-whisper)
 KOKORO_LANGS=a,b                               # comma-separated; one KPipeline per language
 KOKORO_BACKEND=auto                            # auto | torch | mlx (auto = mlx on Apple Silicon if installed)
 KOKORO_DEVICE=auto                             # auto | cuda | mps | cpu (torch backend only)
 DEFAULT_VOICE=af_bella
-SYSTEM_PROMPT=You are a helpful, concise voice assistant. Keep responses short and natural for speech.
+QWEN_TTS_PRELOAD=false                         # true = load the Qwen3-TTS models at startup
 HOST=0.0.0.0
 PORT=5000
 ```
 
 That's the common subset. `.env.example` documents every option, including
 `STT_MODEL`, `WHISPER_BEAM_SIZE`, `WHISPER_VAD_FILTER`, `KOKORO_MLX_MODEL`,
-`DIARIZE_DEVICE` and `HF_TOKEN`.
-
-The UI shows a "LLM server" dropdown; switching it refetches that backend's
-model list. The first backend in the list is the default.
-
-### Disabling thinking on Qwen3 / reasoning models
-
-Reasoning models (Qwen3 etc.) are too slow for natural voice — by the time
-they finish thinking, the conversation has moved on. You can disable
-thinking **for this app only** by adding `chat_template_kwargs` to a
-backend entry:
-
-```json
-{"name":"5090","url":"http://...","chat_template_kwargs":{"enable_thinking":false}}
-```
-
-This kwarg is forwarded per-request, so other clients hitting the same
-vLLM/LM Studio endpoint still get thinking enabled. Works on any model
-whose chat template supports `enable_thinking` (Qwen3 family). Other
-models silently ignore unknown kwargs.
+`DIARIZE_DEVICE`, `HF_TOKEN` and the `QWEN_TTS_*` settings.
 
 ---
 
@@ -164,32 +148,8 @@ First start: the Kokoro weights (~300MB) and the default STT model (e.g.
 ~1.5GB for `distil-large-v3`; Parakeet instead loads on first request)
 download from HuggingFace into the local cache. Subsequent starts are fast.
 Startup ends with one throwaway synthesis per language, so the first real
-request doesn't pay Kokoro's setup cost.
-
-### Accessing the UI
-
-The browser **must** load the app from `localhost` (or HTTPS) — anything
-else and it'll block mic access. How to get there depends on where the
-browser is running:
-
-- **Same machine (Linux desktop, or macOS)**: just open
-  `http://localhost:5000`.
-- **Windows browser → WSL2**: still just `http://localhost:5000`. WSL2
-  forwards `localhost` from Windows to your WSL distro automatically — no
-  SSH needed. Don't use the WSL IP (e.g. `192.168.64.x`) or the Tailscale
-  IP, those will trigger the mic block. If forwarding ever flakes, run
-  `wsl --shutdown` in PowerShell and start WSL again.
-- **Phone / tablet / another machine on your LAN or Tailscale**: SSH-tunnel
-  so the device sees the app on its own `localhost`:
-  ```bash
-  ssh -L 5000:localhost:5000 stavros@<host-ip>
-  ```
-  Then open `http://localhost:5000` on the phone. Termius (iOS) and Termux
-  (Android) can both do this. Requires an SSH server running on the host —
-  either Windows OpenSSH server, or `sshd` inside WSL.
-
-External tools calling `POST /v1/audio/speech` are unaffected by all of
-this — they don't need a mic, so the LAN/Tailscale IP works fine for them.
+request doesn't pay Kokoro's setup cost. Qwen3-TTS weights (~3 GB per model)
+download on first use, or at startup with `QWEN_TTS_PRELOAD=true`.
 
 ---
 
@@ -241,36 +201,6 @@ update required. To expose them:
 
 ---
 
-## Conversation mode
-
-The mic button toggles **Start conversation / Stop conversation**. Once
-started, [Silero VAD](https://github.com/snakers4/silero-vad) (loaded
-in-browser via [`@ricky0123/vad-web`](https://github.com/ricky0123/vad))
-listens continuously: when you stop speaking it sends the utterance for
-processing, then resumes listening after the assistant replies.
-
-**Barge-in is supported.** While the assistant is speaking, you can just
-start talking — it cuts off mid-word, the server cancels the in-flight
-LLM/TTS pipeline, and the assistant remembers what it had said up to that
-point so the next turn picks up coherently.
-
-The first time you click *Start conversation*, the browser downloads the
-~1.5 MB Silero ONNX model (cached after that).
-
-### Echo / feedback loop
-
-Barge-in relies on the browser's built-in **acoustic echo cancellation**
-(AEC) so your speakers don't trigger the mic. Modern Chrome/Edge/Firefox
-do this by default for `getUserMedia`, and it works well in most setups.
-If you find the assistant interrupts itself:
-
-- **Easiest fix**: use headphones — physically removes the loop.
-- Lower your speaker volume so AEC has an easier time.
-- Some Linux audio stacks (PipeWire) need extra config; `echo-cancel` is
-  a separate module there.
-
----
-
 ## Running as a service (macOS, launchd)
 
 `deploy/com.cleantts.plist` is a LaunchAgent template. Substitute `REPO_DIR`,
@@ -300,8 +230,8 @@ Three things that are easy to get wrong:
   `/usr/bin:/bin:/usr/sbin:/sbin` with no Homebrew, so `ffmpeg` would be
   invisible — breaking `/v1/audio/diarize` and every non-WAV
   `/v1/audio/speech` format, at request time rather than at startup.
-- **`WorkingDirectory` must be the repo.** `main.py` resolves `.env`,
-  `templates/` and `static/` relatively.
+- **`WorkingDirectory` must be the repo.** `main.py` resolves `.env`
+  relatively.
 
 The agent starts at **login**, not at boot. With FileVault enabled that is the
 best available: the volume is encrypted until someone enters the password at
@@ -312,8 +242,7 @@ keeps it up.
 ### Binding, and what it means for `localhost`
 
 `HOST=0.0.0.0` binds every interface, which is only safe behind a NAT or
-firewall — cleanTTS has no authentication and proxies to the configured LLM
-backends. On a machine whose `en0` holds a globally routable address (check
+firewall — cleanTTS has no authentication. On a machine whose `en0` holds a globally routable address (check
 with `ipconfig getifaddr en0`) with the macOS firewall off, prefer binding a
 single VPN address, e.g. this host's Tailscale IP:
 
@@ -389,8 +318,7 @@ Pick by the job:
 
 - **Lowest latency** — `parakeet`. It is both faster *and* slightly more
   accurate than the default, and gives word-level timestamps. Setting
-  `STT_MODEL=parakeet` moves `/ws` onto it too: measured 0.44s earlier
-  first-audio on a voice turn.
+  `STT_MODEL=parakeet` makes it the default for requests that name no model.
 - **Best accuracy on names and jargon** — `turbo` with a glossary `prompt`.
   Nothing else comes close, but it is ~36x slower than Parakeet.
 - Never `medium` (1.2x realtime); `distil-large-v3` is dominated by `turbo`.
@@ -413,8 +341,7 @@ Parakeet differences that matter to clients:
 
 ### The VAD pre-pass
 
-`WHISPER_VAD_FILTER` defaults to **on**, and affects both this endpoint and the
-`/ws` voice pipeline. Without it, faster-whisper has two failure modes on real
+`WHISPER_VAD_FILTER` defaults to **on**, and affects every Whisper request. Without it, faster-whisper has two failure modes on real
 recordings:
 
 | input | `vad_filter=false` | `vad_filter=true` |
@@ -582,7 +509,116 @@ curl -s http://localhost:5000/v1/audio/speech/timed \
 
 - `GET /v1/voices` — voices currently loaded on the server (depends on
   `KOKORO_LANGS`)
-- `GET /v1/models` — OpenAI-compat model list (always returns `kokoro`)
+- `GET /v1/voices?model=qwen3-tts` — Qwen3-TTS speakers (loads the model)
+- `GET /v1/models` — OpenAI-compat model list (`kokoro`, `qwen3-tts`)
+
+---
+
+## Qwen3-TTS (second TTS engine)
+
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) runs alongside Kokoro through
+`mlx-audio` (Apple Silicon only). Kokoro stays the default; pick Qwen per request:
+
+```bash
+# Either name the model on the usual route...
+curl -s http://localhost:5000/v1/audio/speech -H 'content-type: application/json' \
+  -d '{"model":"qwen3-tts","input":"Hello there.","voice":"ryan"}' -o out.wav
+# ...or use the dedicated route, where `model` is optional.
+curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application/json' \
+  -d '{"input":"Hello there.","stream":true}' -o out.wav
+# A saved (cloned) voice, and a style instruction on a preset voice:
+curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application/json' \
+  -d '{"input":"Hello there.","voice":"myvoice"}' -o out.wav
+curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application/json' \
+  -d '{"input":"We won!","voice":"aiden","instructions":"Extremely excited."}' -o out.wav
+```
+
+- **Voices** (`GET /v1/voices?model=qwen3-tts`): `ryan` and `aiden` are the
+  English speakers; also `vivian`, `serena`, `uncle_fu`, `dylan`, `eric`,
+  `ono_anna`, `sohee`. A request that sets no `voice` gets `QWEN_TTS_VOICE`
+  (`ryan`), not Kokoro's default. An unknown voice is a 400 listing the valid ones.
+- **`instructions`** (the OpenAI field name): speaking style, e.g.
+  `"Calm and warm."`. Honoured by the 1.7B models; the 0.6B ones ignore it.
+- **`stream: true`**: audio is sent as it's generated — `wav` (header with
+  unknown length) or `pcm` only. This only helps a client that plays audio
+  while it downloads (a live voice channel, a player on a stream URL); one
+  that needs the whole file first (a chat attachment) gains nothing, and should
+  leave `stream` off to get a WAV with correct size fields. Hanging up stops
+  generation.
+- **Saved voices** (`"voice": "myvoice"`): any `<name>.wav` + `<name>.txt`
+  (5–15s of speech and its exact transcript) in `voices/` (`QWEN_TTS_VOICES_DIR`)
+  is a voice, cloned by the Base model on every request. New files work without
+  a restart; they're listed under `saved_voices` in `/v1/voices?model=qwen3-tts`.
+  `instructions` is ignored for them. ~1.9s for a one-liner (vs ~1.3s preset);
+  the first request after a restart adds ~2.5s while the clip is encoded.
+- **Designing a voice** (`"model": "qwen3-tts-design"`): `instructions` is the
+  description of the voice to invent ("a gravelly old Scottish sea captain").
+  It invents a *different* voice on every call, so use it to audition, then
+  save the clip you like into `voices/` (with its transcript) to keep it.
+- **Not supported on Qwen:** `speed` (ignored), voice blends, and
+  `/v1/audio/speech/timed` (always Kokoro — Qwen gives no word timings).
+- **Three models** back these, all 1.7B 8bit: CustomVoice (preset voices),
+  VoiceDesign (`qwen3-tts-design`) and Base (saved voices).
+- Each of the three models (preset, design, saved-voice) loads on its first
+  request (~5s from the local cache; `QWEN_TTS_PRELOAD=true` loads all three
+  at startup instead — ~9 GB resident). It runs on its own
+  MLX thread, so a long Qwen job doesn't queue Kokoro requests.
+
+### Adding a voice from a real recording
+
+A real recording clones far better than a described voice. Measured on one
+speaker: six designed takes from a careful description all landed at
+160–239 Hz median pitch against the real speaker's 96 Hz, and scored *lower*
+speaker similarity to the real voice (0.91) than an unrelated Kokoro voice (0.925). The
+clone of a 15s real clip scored 0.97–0.98, and every test line transcribed
+back word-for-word.
+
+To add one:
+
+1. **Pick the clip:** one speaker, no music, laughter or applause, natural
+   talking. Run it through `POST /v1/audio/diarize` if unsure; a second voice
+   would be blended into the clone.
+2. **Trim to 5–15s**, cutting in a pause, and convert to 24kHz mono WAV:
+   `ffmpeg -i in.wav -t 15 -ac 1 -ar 24000 -c:a pcm_s16le voices/<name>.wav`
+3. **Write its exact transcript** to `voices/<name>.txt`. Transcribe it with
+   `/v1/audio/transcriptions` and fix any misheard words by ear. The transcript
+   has to match the audio.
+4. Use it as `"voice": "<name>"`. No restart needed.
+
+About 1 take in 16 drifts noticeably higher in pitch. Lowering the sampling
+temperature (0.6 vs the default 0.9, 16 takes each) didn't change that.
+
+**Don't commit voices of real people.** The whole `voices/` folder is
+gitignored, so saved voices stay on the machine that made them.
+
+### Kokoro vs Qwen3-TTS, measured
+
+M-series Mac, MLX, median of 3 after warm-up. "First audio" is when the first
+chunk is ready when streaming; without streaming it equals the total.
+RTF = compute time ÷ audio length (below 1 is faster than real time).
+
+| model | 1-line reply (~4s audio) | 3 sentences (~12s) | paragraph (~38s) | first audio, streamed | RTF | peak mem |
+|---|---|---|---|---|---|---|
+| **Kokoro-82M** (bf16) | **0.14s** | **0.40s** | **1.26s** | — (not streamed) | **0.035** | 1.4–3.3 GB |
+| Qwen 0.6B CustomVoice bf16 | 1.69s | 5.25s | 18.1s | 0.23s | 0.40 | 5.5–9.1 GB |
+| Qwen 0.6B CustomVoice 8bit | 1.42s | 3.79s | 14.1s | 0.19s | 0.32 | 5.1–8.7 GB |
+| Qwen 1.7B CustomVoice bf16 | 1.78s | 5.69s | 20.2s | 0.28s | 0.48 | 7.5–10.8 GB |
+| **Qwen 1.7B CustomVoice 8bit** (default) | 1.28s | 3.70s | 14.1s | 0.22s | 0.36 | 6.2–9.6 GB |
+| Qwen 1.7B CustomVoice 4bit | 1.37s | 3.98s | 18.8s* | 0.20s | 0.33 | 6.6–10.8 GB |
+| Qwen 1.7B VoiceDesign 8bit | 1.64s | 3.76s | 15.2s | 0.26s | 0.37 | 6.2–9.7 GB |
+
+\* 4bit read the paragraph much more slowly (55s of audio vs ~38s).
+
+- **Accuracy:** every model read the scripts correctly — 0–7% WER when
+  transcribed back with Parakeet, the same as Kokoro (the residue is number
+  formatting, e.g. "five fifteen" → "5:15").
+- **Kokoro is ~10x faster** in total, in every size. Qwen is still ~3x faster
+  than real time, so **streamed** it starts in ~0.2s and never stalls playback;
+  **not streamed**, a client waits 1.3s for one line and ~14s for a paragraph.
+- **8bit is the sweet spot**: faster than bf16 at no measurable accuracy cost,
+  and the 1.7B 8bit is as fast as the 0.6B 8bit while also honouring `instructions`.
+- **Alongside Kokoro:** during a 15s Qwen job, Kokoro requests went from
+  0.24s to 0.30s and Parakeet STT was unaffected.
 
 ---
 
@@ -644,15 +680,10 @@ curl -X POST http://localhost:5000/v1/audio/speech \
 ## Architecture notes
 
 **Kokoro is pure TTS.** It has no understanding of the text — give it a
-string, get a waveform. All "thinking" happens in the LLM. This means:
+string, get a waveform. Your code (or your agent's LLM) decides what to say
+and POSTs the string to `/v1/audio/speech`.
 
-- For the voice assistant, the LLM (vLLM on your remote machine) generates
-  the reply, and Kokoro speaks it.
-- For external tools (race telemetry, alerts, etc.), your code already knows
-  what to say — just POST the string to `/v1/audio/speech`. **No LLM
-  required** for that path.
-
-**Four models, two devices.** On Apple Silicon the split is not obvious and
+**Five engines, two devices.** On Apple Silicon the split is not obvious and
 drives most of the performance decisions here:
 
 | stage | runtime | device | why |
@@ -661,20 +692,15 @@ drives most of the performance decisions here:
 | Parakeet STT | parakeet-mlx / MLX | **GPU** | MLX targets Metal |
 | Kokoro TTS | mlx-audio / MLX | **GPU** | MLX targets Metal (PyTorch on CPU is the fallback; MPS is slower than either) |
 | Diarization | pyannote / PyTorch | **GPU** | MPS |
+| Qwen3-TTS (optional) | mlx-audio / MLX | **GPU** | MLX targets Metal; its own thread, so it never queues Kokoro |
 
 So Whisper is the only stage that cannot use the GPU, which is why bigger
 Whisper models cost so much here (`large-v3-turbo` is ~36x slower than
 Parakeet) and why Parakeet exists as an option. It also means a long
 diarization competes with Kokoro for the GPU (measured ~5x slower synthesis
 on the old MPS backend while one runs) but does not slow Whisper, which is on
-the other device.
-
-**Sentence-level streaming.** During the voice assistant flow, LLM tokens
-are accumulated until a sentence boundary, at which point that sentence is
-queued for TTS while the LLM keeps generating. First audio plays before the
-LLM has finished thinking. The *first* chunk can also break at a comma,
-semicolon or colon once it has at least 6 words, so a long opening sentence
-starts playing sooner.
+the other device. A long Qwen3-TTS job costs Kokoro ~25% (0.24s → 0.30s per
+request) and left Parakeet unaffected.
 
 ---
 
@@ -699,11 +725,7 @@ If you turned it off, turn it back on. Parakeet is much more resistant but not
 immune — it produced `"El turismo."` on some pink noise.
 
 
-- **No mic in browser**: you're on `http://<lan-ip>:5000`. Use `localhost`
-  or HTTPS.
 - **CUDA OOM on the 3080**: switch `WHISPER_MODEL=small` or `tiny`.
-- **`OSError: PortAudio` / no sound**: check the browser's tab volume; the
-  audio is sent as base64 WAV over the WebSocket.
 - **Kokoro voice not found**: voice ids are case-sensitive, and the voice's
   language must be in `KOKORO_LANGS` (e.g. `bf_emma` requires `b`).
 - **Kokoro on MLX fails with an espeak `phontab` error**: espeak-ng can't
