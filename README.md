@@ -545,12 +545,23 @@ curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application
   that needs the whole file first (a chat attachment) gains nothing, and should
   leave `stream` off to get a WAV with correct size fields. Hanging up stops
   generation.
-- **Saved voices** (`"voice": "myvoice"`): any `<name>.wav` + `<name>.txt`
-  (5–15s of speech and its exact transcript) in `voices/` (`QWEN_TTS_VOICES_DIR`)
-  is a voice, cloned by the Base model on every request. New files work without
-  a restart; they're listed under `saved_voices` in `/v1/voices?model=qwen3-tts`.
-  `instructions` is ignored for them. ~1.9s for a one-liner (vs ~1.3s preset);
-  the first request after a restart adds ~2.5s while the clip is encoded.
+- **`temperature`**: sampling temperature (default `QWEN_TTS_TEMPERATURE`,
+  else the model's 0.9). Every Qwen output is sampled, so delivery varies
+  from call to call. A lower value is steadier but flatter, and `0` is greedy.
+  Streaming doesn't change the output: the same seed gives the same audio
+  either way.
+- **Saved voices** (`"voice": "myvoice"`): any `<name>.wav` (10–20s of speech)
+  in `voices/` (`QWEN_TTS_VOICES_DIR`) is a voice, cloned by the Base model on
+  every request. New files work without a restart; they're listed under
+  `saved_voices` in `/v1/voices?model=qwen3-tts`. `instructions` is ignored
+  for them. ~1.2s for a one-liner.
+- **`xvec_only`** (saved voices): by default (`QWEN_TTS_XVEC_ONLY=true`) a
+  saved voice is cloned *speaker-only*, from the clip's voice fingerprint.
+  `false` uses the full clip plus its transcript (`<name>.txt`), which copies
+  the clip's delivery more closely but drifts on short lines (see below). A
+  voice with no `.txt` is always speaker-only. Saved voices use
+  `QWEN_TTS_CLONE_LANGUAGE` (default `auto`, which keeps the clip's accent;
+  `english` flattens it toward General American).
 - **Designing a voice** (`"model": "qwen3-tts-design"`): `instructions` is the
   description of the voice to invent ("a gravelly old Scottish sea captain").
   It invents a *different* voice on every call, so use it to audition, then
@@ -578,15 +589,24 @@ To add one:
 1. **Pick the clip:** one speaker, no music, laughter or applause, natural
    talking. Run it through `POST /v1/audio/diarize` if unsure; a second voice
    would be blended into the clone.
-2. **Trim to 5–15s**, cutting in a pause, and convert to 24kHz mono WAV:
-   `ffmpeg -i in.wav -t 15 -ac 1 -ar 24000 -c:a pcm_s16le voices/<name>.wav`
-3. **Write its exact transcript** to `voices/<name>.txt`. Transcribe it with
-   `/v1/audio/transcriptions` and fix any misheard words by ear. The transcript
-   has to match the audio.
+2. **Trim to 10–20s**, ending on a calm, finished statement (not a question
+   or exclamation), with a short fade, as 24kHz mono WAV:
+   `ffmpeg -i in.wav -t 16 -ac 1 -ar 24000 -af "afade=t=out:st=15.85:d=0.15" -c:a pcm_s16le voices/<name>.wav`
+3. **Optional: write its exact transcript** to `voices/<name>.txt`, needed
+   only for `xvec_only: false`. Transcribe it with `/v1/audio/transcriptions`
+   and fix any misheard words by ear.
 4. Use it as `"voice": "<name>"`. No restart needed.
 
-About 1 take in 16 drifts noticeably higher in pitch. Lowering the sampling
-temperature (0.6 vs the default 0.9, 16 takes each) didn't change that.
+**Speaker-only vs full clip, measured** (one male voice, 8 mixed lines × 2
+seeds, temperature 0.65; real speaker 97 Hz median pitch). Full-clip mode put
+4–7 of 16 takes above 140 Hz (up to 399 Hz, a different-sounding person on
+"Sure." / "Got it."). Speaker-only with `auto` put 1 of 16 there (an excited
+line, at 156 Hz), median 96 Hz, with no run-ons or wrong words. Speaker-only
+with `english` read slower and flattens the accent. The "golden take" trick
+(re-cloning from the clone reading a script) made this voice darker and
+slower (70 Hz median), so it only helps when the original clip is short,
+noisy or dramatic. The model's own speaker embedding is no judge: it scored
+a different speaker 0.99 against this voice.
 
 **Don't commit voices of real people.** The whole `voices/` folder is
 gitignored, so saved voices stay on the machine that made them.

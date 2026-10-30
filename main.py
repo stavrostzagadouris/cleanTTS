@@ -129,6 +129,10 @@ QWEN_TTS_VOICE = os.getenv("QWEN_TTS_VOICE", "ryan")
 # "auto" sends no language id at all; naming the language is what the model
 # was benchmarked with here.
 QWEN_TTS_LANGUAGE = os.getenv("QWEN_TTS_LANGUAGE", "english")
+# Sampling temperature for every Qwen model. Unset = the checkpoint's own
+# generation_config.json (0.9). Lower is steadier but flatter; a request's
+# `temperature` overrides it.
+QWEN_TTS_TEMPERATURE = float(os.getenv("QWEN_TTS_TEMPERATURE")) if os.getenv("QWEN_TTS_TEMPERATURE") else None
 QWEN_TTS_PRELOAD = os.getenv("QWEN_TTS_PRELOAD", "false").strip().lower() in ("1", "true", "yes", "on")
 QWEN_TTS_ALIASES = {"qwen3-tts", "qwen3_tts", "qwen-tts", "qwen"}
 # VoiceDesign: invents a voice from a text description in `instructions`. It
@@ -139,11 +143,20 @@ QWEN_TTS_DESIGN_MODEL = os.getenv(
     "QWEN_TTS_DESIGN_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
 )
 QWEN_TTS_DESIGN_ALIASES = {"qwen3-tts-design", "qwen3_tts_design", "qwen-tts-design", "qwen-design"}
-# Base: clones a saved voice from a reference clip, identically every call.
+# Base: clones a saved voice from a reference clip. Output is sampled, so
+# delivery varies call to call (see QWEN_TTS_TEMPERATURE).
 QWEN_TTS_BASE_MODEL = os.getenv("QWEN_TTS_BASE_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit")
-# Saved voices: <name>.wav (5-15s of speech) next to <name>.txt (its exact
-# transcript). Read per request, so a new voice works without a restart.
+# Saved voices: <name>.wav (10-20s of speech) next to <name>.txt (its exact
+# transcript; optional). Read per request, so a new voice works without a restart.
 QWEN_TTS_VOICES_DIR = os.getenv("QWEN_TTS_VOICES_DIR", "voices")
+# Speaker-only (x-vector) cloning uses just the clip's voice fingerprint. It
+# keeps one identity on short lines, where full-clip (ICL) cloning drifts in
+# age/gender/accent and can run on with the clip's last words. A request's
+# `xvec_only` overrides; a voice with no .txt is always speaker-only.
+QWEN_TTS_XVEC_ONLY = os.getenv("QWEN_TTS_XVEC_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+# Language for saved voices. "auto" keeps the clip's accent; "english"
+# flattens it toward General American.
+QWEN_TTS_CLONE_LANGUAGE = os.getenv("QWEN_TTS_CLONE_LANGUAGE", "auto")
 # Its own MLX thread, for the same thread-affinity reason as Kokoro's. Separate
 # from Kokoro's so a long Qwen generation never queues a Kokoro request.
 QWEN_TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts")
@@ -600,7 +613,7 @@ class SpeechRequest(BaseModel):
     )
     response_format: str = Field("wav", description="wav | opus | mp3 | flac | aac | pcm")
     speed: float = Field(1.0, ge=0.25, le=4.0)
-    # Additive, Qwen3-TTS only; Kokoro ignores both.
+    # Additive, Qwen3-TTS only; Kokoro ignores these.
     instructions: str | None = Field(
         None,
         description="Qwen3-TTS: speaking style/emotion for preset voices, e.g. "
@@ -610,6 +623,18 @@ class SpeechRequest(BaseModel):
     stream: bool = Field(
         False,
         description="Qwen3-TTS: stream audio as it is generated (wav or pcm only).",
+    )
+    temperature: float | None = Field(
+        None,
+        ge=0.0,
+        description="Qwen3-TTS: sampling temperature (default QWEN_TTS_TEMPERATURE, "
+        "else 0.9). Lower = more consistent delivery; 0 = greedy.",
+    )
+    xvec_only: bool | None = Field(
+        None,
+        description="Qwen3-TTS saved voices: true = clone from the clip's voice "
+        "fingerprint only (steady identity, no run-on); false = full-clip "
+        "(ICL) clone. Default QWEN_TTS_XVEC_ONLY.",
     )
 
 
@@ -682,9 +707,10 @@ def qwen_tts_model(repo: str = QWEN_TTS_MODEL):
     return model
 
 
-def qwen_saved_voices() -> dict[str, tuple[str, str]]:
-    """Saved voices in QWEN_TTS_VOICES_DIR: name -> (wav path, transcript).
-    Only names found on disk are ever used as paths."""
+def qwen_saved_voices() -> dict[str, tuple[str, str | None]]:
+    """Saved voices in QWEN_TTS_VOICES_DIR: name -> (wav path, transcript, or
+    None for a speaker-only voice with no .txt). Only names found on disk are
+    ever used as paths."""
     voices = {}
     try:
         names = os.listdir(QWEN_TTS_VOICES_DIR)
@@ -692,10 +718,14 @@ def qwen_saved_voices() -> dict[str, tuple[str, str]]:
         return voices
     for fname in names:
         stem, ext = os.path.splitext(fname)
+        if ext.lower() != ".wav":
+            continue
         txt = os.path.join(QWEN_TTS_VOICES_DIR, stem + ".txt")
-        if ext.lower() == ".wav" and os.path.exists(txt):
+        transcript = None
+        if os.path.exists(txt):
             with open(txt) as f:
-                voices[stem.lower()] = (os.path.join(QWEN_TTS_VOICES_DIR, fname), f.read().strip())
+                transcript = f.read().strip() or None
+        voices[stem.lower()] = (os.path.join(QWEN_TTS_VOICES_DIR, fname), transcript)
     return voices
 
 
@@ -711,7 +741,16 @@ def resolve_qwen(req: SpeechRequest) -> tuple[str, dict]:
     voice = req.voice if "voice" in req.model_fields_set else QWEN_TTS_VOICE
     saved = qwen_saved_voices().get(voice.strip().lower())
     if saved:
-        return QWEN_TTS_BASE_MODEL, {"ref_audio": saved[0], "ref_text": saved[1]}
+        wav, transcript = saved
+        xvec_only = QWEN_TTS_XVEC_ONLY if req.xvec_only is None else req.xvec_only
+        if xvec_only or transcript is None:
+            if req.xvec_only is False:
+                raise HTTPException(400, f"Saved voice {voice!r} has no transcript; it is speaker-only.")
+            # Speaker-only: just the clip's voice fingerprint, so every line is
+            # the same person and nothing from the clip can run on.
+            return QWEN_TTS_BASE_MODEL, {"ref_audio": wav, "lang_code": QWEN_TTS_CLONE_LANGUAGE}
+        # Full clip (ICL): continues from the clip, copying its delivery.
+        return QWEN_TTS_BASE_MODEL, {"ref_audio": wav, "ref_text": transcript, "lang_code": QWEN_TTS_CLONE_LANGUAGE}
     kwargs = {"voice": voice}
     if req.instructions:
         kwargs["instruct"] = req.instructions
@@ -722,7 +761,9 @@ def qwen_generate(repo: str, text: str, kwargs: dict, stream: bool):
     """Yield float32 audio chunks from Qwen3-TTS. Unknown preset voices raise
     ValueError from mlx-audio itself, listing the valid ones."""
     model = qwen_tts_model(repo)
-    kwargs = dict(kwargs, text=split_marks(text)[0], lang_code=QWEN_TTS_LANGUAGE)
+    kwargs = dict({"lang_code": QWEN_TTS_LANGUAGE}, **kwargs, text=split_marks(text)[0])
+    if kwargs.get("temperature") is None:
+        kwargs["temperature"] = QWEN_TTS_TEMPERATURE
     if stream:
         # ~6 codec frames at 12.5Hz: first audio in ~0.25s on an M-series Mac.
         kwargs.update(stream=True, streaming_interval=0.48)
@@ -795,6 +836,7 @@ async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> 
 
 async def speak_qwen(req: SpeechRequest, fmt: str) -> Response:
     repo, kwargs = resolve_qwen(req)
+    kwargs["temperature"] = req.temperature
     if req.stream:
         if fmt not in ("wav", "pcm"):
             raise HTTPException(400, "stream=true supports response_format wav or pcm only.")
@@ -1238,6 +1280,9 @@ async def health():
         "qwen_tts": {
             "model": QWEN_TTS_MODEL,
             "voice": QWEN_TTS_VOICE,
+            "temperature": QWEN_TTS_TEMPERATURE,
+            "xvec_only": QWEN_TTS_XVEC_ONLY,
+            "clone_language": QWEN_TTS_CLONE_LANGUAGE,
             "device": "mps",
             "design_model": QWEN_TTS_DESIGN_MODEL,
             "base_model": QWEN_TTS_BASE_MODEL,
