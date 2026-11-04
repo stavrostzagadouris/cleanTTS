@@ -991,7 +991,9 @@ def parakeet_verbose_payload(sentences: list, duration: float, model_name: str) 
             "text": sn.text,
             "tokens": [int(t.id) for t in getattr(sn, "tokens", []) if hasattr(t, "id")],
             "temperature": 0.0,
-            "avg_logprob": math.log(conf) if conf > 0 else float("-inf"),
+            # Floor conf so a zero-confidence segment gives a finite (very low)
+            # logprob: -inf is not valid JSON and 500s the whole response.
+            "avg_logprob": math.log(max(conf, 1e-10)),
             "compression_ratio": 0.0,
             "no_speech_prob": 0.0,
             # Native to this engine; absent from Whisper responses.
