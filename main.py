@@ -227,11 +227,11 @@ async def lifespan(app: FastAPI):
     state["parakeet_models"] = {}
     _default = resolve_whisper_model(None)
     if is_parakeet(_default):
-        # NOT preloaded here: building the model on the event-loop thread and
-        # then running inference in a to_thread worker fails inside mx.eval()
-        # ("There is no Stream(cpu, 1) in current thread"). get_parakeet_model
-        # loads it inside a worker on first use, which works.
-        log.info("Default STT is Parakeet (%s); loads on first use.", _default)
+        # Loaded by warm_parakeet below, never directly here: building the
+        # model on the event-loop thread and then running inference in a
+        # to_thread worker fails inside mx.eval() ("There is no Stream(cpu, 1)
+        # in current thread"). get_parakeet_model loads it inside a worker.
+        log.info("Default STT is Parakeet (%s).", _default)
     else:
         log.info("Loading Whisper: %s on %s", _default, WHISPER_DEVICE)
         state["whisper_models"][_default] = load_whisper_model(_default)
@@ -265,6 +265,19 @@ async def lifespan(app: FastAPI):
     if QWEN_TTS_PRELOAD:
         for repo in (QWEN_TTS_MODEL, QWEN_TTS_BASE_MODEL, QWEN_TTS_DESIGN_MODEL):
             await asyncio.get_running_loop().run_in_executor(QWEN_TTS_EXECUTOR, qwen_tts_model, repo)
+
+    # Parakeet aligns Qwen's word timestamps (and is usually the default STT),
+    # so load and warm it in the background: the server starts serving at
+    # once, and the first timed request after a restart isn't ~1.5s late.
+    async def warm_parakeet():
+        try:
+            model = await get_parakeet_model(PARAKEET_MODEL)
+            await asyncio.to_thread(parakeet_words, model, np.zeros(16000, np.float32), 16000)
+            log.info("Parakeet warmed up.")
+        except Exception as e:
+            log.warning("Parakeet preload failed (loads on first use instead): %s", e)
+
+    state["parakeet_warmup"] = asyncio.create_task(warm_parakeet())
 
     yield
 

@@ -565,9 +565,9 @@ curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application
   audio. Words Parakeet hears differently ("12" → "twelve", names) are timed
   from the span they were heard in; words it misses are interpolated.
   Timings are in 80ms steps. If alignment fails, a
-  `{"type":"warning"}` event is sent and the audio still finishes. The first
-  request after a restart also loads Parakeet (~1.5s), so its first few
-  words arrive late.
+  `{"type":"warning"}` event is sent and the audio still finishes. Parakeet
+  is loaded and warmed in the background at startup (~1.5s), so even the
+  first request after a restart gets on-time words.
 - **`temperature`**: sampling temperature (default `QWEN_TTS_TEMPERATURE`,
   else the model's 0.9). Every Qwen output is sampled, so delivery varies
   from call to call. A lower value is steadier but flatter, and `0` is greedy.
