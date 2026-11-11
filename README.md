@@ -545,6 +545,29 @@ curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application
   that needs the whole file first (a chat attachment) gains nothing, and should
   leave `stream` off to get a WAV with correct size fields. Hanging up stops
   generation.
+- **`timestamps: true`** (with `stream: true`): live word timings for
+  captions. The response becomes NDJSON (`application/x-ndjson`), one event
+  per line, instead of bare audio:
+  ```
+  {"type":"start","sample_rate":24000,"format":"pcm_s16le","channels":1,"words":24}
+  {"type":"audio","pcm":"<base64 16-bit LE mono PCM>"}
+  {"type":"word","i":3,"char":15,"word":"checked","start":1.2}
+  {"type":"done","duration":8.8}
+  ```
+  Qwen has no alignment of its own, so the already-loaded Parakeet model
+  re-reads the audio made so far after every ~1s of new audio (~0.2s on the
+  GPU, alongside synthesis; no measurable slowdown) and its words are lined
+  up against the input. Each input word (split on whitespace) gets exactly
+  one `word` event, in order, ~1s behind generation. Generation runs ~3x
+  faster than playback, so words normally arrive seconds before they're
+  spoken. `i` is the word's index, `char` its offset in `input` (after any
+  `<mark/>` tags are removed), `start` seconds from the start of this clip's
+  audio. Words Parakeet hears differently ("12" → "twelve", names) are timed
+  from the span they were heard in; words it misses are interpolated.
+  Timings are in 80ms steps. If alignment fails, a
+  `{"type":"warning"}` event is sent and the audio still finishes. The first
+  request after a restart also loads Parakeet (~1.5s), so its first few
+  words arrive late.
 - **`temperature`**: sampling temperature (default `QWEN_TTS_TEMPERATURE`,
   else the model's 0.9). Every Qwen output is sampled, so delivery varies
   from call to call. A lower value is steadier but flatter, and `0` is greedy.
@@ -567,7 +590,8 @@ curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application
   It invents a *different* voice on every call, so use it to audition, then
   save the clip you like into `voices/` (with its transcript) to keep it.
 - **Not supported on Qwen:** `speed` (ignored), voice blends, and
-  `/v1/audio/speech/timed` (always Kokoro — Qwen gives no word timings).
+  `/v1/audio/speech/timed` (always Kokoro; for Qwen word timings use
+  `stream` + `timestamps` above).
 - **Three models** back these, all 1.7B 8bit: CustomVoice (preset voices),
   VoiceDesign (`qwen3-tts-design`) and Base (saved voices).
 - Each of the three models (preset, design, saved-voice) loads on its first

@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import difflib
 import importlib.util
 import io
+import json
 import logging
 import math
 import os
@@ -636,6 +638,12 @@ class SpeechRequest(BaseModel):
         "fingerprint only (steady identity, no run-on); false = full-clip "
         "(ICL) clone. Default QWEN_TTS_XVEC_ONLY.",
     )
+    timestamps: bool = Field(
+        False,
+        description="Qwen3-TTS with stream=true: respond with NDJSON events "
+        "(audio chunks as base64 PCM, plus each input word's start time as soon "
+        "as it's known) instead of bare audio.",
+    )
 
 
 def check_speech_request(req: SpeechRequest) -> str:
@@ -814,9 +822,11 @@ async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> 
     if first is done:
         raise HTTPException(500, "TTS produced no audio (Qwen3-TTS returned no chunks).")
     sample_rate = state["qwen_tts"][repo].sample_rate
-
-    def pcm16(chunk: np.ndarray) -> bytes:
-        return (np.clip(chunk, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    if req.timestamps:
+        return StreamingResponse(
+            timed_qwen_body(req.input, gen, first, done, next_chunk, sample_rate),
+            media_type="application/x-ndjson",
+        )
 
     async def body():
         # One chunk per executor hop, so a client that disconnects stops
@@ -834,9 +844,175 @@ async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> 
     return StreamingResponse(body(), media_type=SUPPORTED_FORMATS[fmt][0])
 
 
+def pcm16(chunk: np.ndarray) -> bytes:
+    return (np.clip(chunk, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+
+
+# Word timestamps for streamed Qwen3-TTS (timestamps=true). Qwen has no
+# text-to-audio alignment of its own, so Parakeet re-reads all the audio made
+# so far each time another ALIGN_EVERY_S of it exists (~0.2s of GPU, in
+# parallel with synthesis), and its words are lined up against the input text.
+# Words ending within ALIGN_SETTLE_S of the audio's current end are held back:
+# they may be cut off mid-word and recognized differently next pass.
+ALIGN_EVERY_S = 1.0
+ALIGN_SETTLE_S = 0.5
+
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^\w]", "", w.lower())
+
+
+def parakeet_words(model, audio: np.ndarray, sr: int) -> list[tuple[str, float, float]]:
+    """Recognize float32 mono audio; return [(word, start, end)]. Parakeet emits
+    subword tokens, so they're merged on the leading space that starts a word.
+    Blocking — call via to_thread."""
+    import mlx.core as mx
+    from parakeet_mlx.audio import get_logmel
+    from scipy.signal import resample_poly
+
+    target = model.preprocessor_config.sample_rate
+    if sr != target:
+        g = math.gcd(sr, target)
+        audio = resample_poly(audio, target // g, sr // g)
+    # float32, as parakeet_mlx's own load_audio gives it: get_logmel breaks on bf16.
+    mel = get_logmel(mx.array(np.asarray(audio, dtype=np.float32)), model.preprocessor_config)
+    words: list[list] = []
+    for sn in model.generate(mel)[0].sentences:
+        for t in sn.tokens:
+            if t.text.startswith(" ") or not words:
+                words.append([t.text.strip(), t.start, t.end])
+            else:
+                words[-1][0] += t.text
+                words[-1][2] = t.end
+    return [(w, s, e) for w, s, e in words if _norm_word(w)]
+
+
+class WordTimer:
+    """Turns successive recognitions of a growing clip into start times for
+    the words of the known input text, emitted once each, in order."""
+
+    def __init__(self, text: str):
+        self.words = [(m.group(), m.start()) for m in re.finditer(r"\S+", text)]
+        self.norm = [_norm_word(w) for w, _ in self.words]
+        self.next = 0
+        self.last = 0.0
+
+    def match(self, asr: list[tuple[str, float, float]]) -> list[tuple[float, float] | None]:
+        """Per input word: (start, end of the evidence for it), or None if
+        nothing recognized lines up with it. A mismatched run ("12" heard as
+        "twelve", a misheard name) is spread evenly over the recognized span."""
+        out: list[tuple[float, float] | None] = [None] * len(self.words)
+        sm = difflib.SequenceMatcher(None, self.norm, [_norm_word(w) for w, _, _ in asr], autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag not in ("equal", "replace"):
+                continue
+            if tag == "equal":
+                for k in range(i2 - i1):
+                    out[i1 + k] = (asr[j1 + k][1], asr[j1 + k][2])
+            else:
+                lo, hi, n = asr[j1][1], asr[j2 - 1][2], i2 - i1
+                for k in range(n):
+                    out[i1 + k] = (lo + (hi - lo) * k / n, hi)
+        return out
+
+    def update(self, asr: list[tuple[str, float, float]], audio_len: float, final: bool) -> list[dict]:
+        matched = self.match(asr)
+        horizon = audio_len if final else audio_len - ALIGN_SETTLE_S
+        events: list[dict] = []
+
+        def emit(i: int, start: float):
+            self.last = max(start, self.last)
+            word, char = self.words[i]
+            events.append({"type": "word", "i": i, "char": char, "word": word, "start": round(self.last, 3)})
+
+        i = self.next
+        while i < len(self.words):
+            m = matched[i]
+            if m is not None:
+                if m[1] > horizon:
+                    break
+                emit(i, m[0])
+                i += 1
+                continue
+            # Unmatched run: place it evenly between its matched neighbours.
+            j = next((k for k in range(i + 1, len(self.words)) if matched[k] is not None), None)
+            if j is not None and matched[j][1] > horizon:
+                break
+            if j is None and not final:
+                break
+            hi = matched[j][0] if j is not None else audio_len
+            stop = j if j is not None else len(self.words)
+            lo, gap = self.last, stop - i
+            for k in range(gap):
+                emit(i + k, lo + (hi - lo) * (k + 1) / (gap + 1))
+            i = stop
+        self.next = i
+        return events
+
+
+async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: int):
+    """NDJSON stream for timestamps=true: audio events as fast as Qwen makes
+    them, word events as soon as alignment settles. Alignment never waits on
+    or delays the audio; if it fails, the audio still completes."""
+    loop = asyncio.get_running_loop()
+    timer = WordTimer(split_marks(text)[0])
+    parts: list[np.ndarray] = []
+    total = aligned_at = 0
+    task: asyncio.Task | None = None
+    failed = False
+
+    def line(obj: dict) -> bytes:
+        return (json.dumps(obj) + "\n").encode()
+
+    async def align(audio: np.ndarray, final: bool) -> list[dict]:
+        model = await get_parakeet_model(PARAKEET_MODEL)
+        asr = await asyncio.to_thread(parakeet_words, model, audio, sample_rate)
+        return timer.update(asr, len(audio) / sample_rate, final)
+
+    async def collect(t: asyncio.Task) -> list[bytes]:
+        nonlocal failed
+        try:
+            return [line(e) for e in await t]
+        except Exception as e:
+            log.exception("Word alignment failed")
+            failed = True
+            return [line({"type": "warning", "message": f"word timing unavailable: {e}"})]
+
+    try:
+        yield line({"type": "start", "sample_rate": sample_rate, "format": "pcm_s16le",
+                    "channels": 1, "words": len(timer.words)})
+        chunk = first
+        while chunk is not done:
+            parts.append(chunk)
+            total += len(chunk)
+            yield line({"type": "audio", "pcm": base64.b64encode(pcm16(chunk)).decode()})
+            if task is not None and task.done():
+                for out in await collect(task):
+                    yield out
+                task = None
+            if task is None and not failed and total - aligned_at >= ALIGN_EVERY_S * sample_rate:
+                aligned_at = total
+                task = asyncio.create_task(align(np.concatenate(parts), False))
+            chunk = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+        if task is not None:
+            for out in await collect(task):
+                yield out
+            task = None
+        if not failed and parts:
+            for out in await collect(asyncio.create_task(align(np.concatenate(parts), True))):
+                yield out
+        yield line({"type": "done", "duration": round(total / sample_rate, 3)})
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+        await loop.run_in_executor(QWEN_TTS_EXECUTOR, gen.close)
+
+
 async def speak_qwen(req: SpeechRequest, fmt: str) -> Response:
     repo, kwargs = resolve_qwen(req)
     kwargs["temperature"] = req.temperature
+    if req.timestamps and not req.stream:
+        raise HTTPException(400, "timestamps=true needs stream=true.")
     if req.stream:
         if fmt not in ("wav", "pcm"):
             raise HTTPException(400, "stream=true supports response_format wav or pcm only.")
