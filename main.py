@@ -135,6 +135,10 @@ QWEN_TTS_LANGUAGE = os.getenv("QWEN_TTS_LANGUAGE", "english")
 # generation_config.json (0.9). Lower is steadier but flatter; a request's
 # `temperature` overrides it.
 QWEN_TTS_TEMPERATURE = float(os.getenv("QWEN_TTS_TEMPERATURE")) if os.getenv("QWEN_TTS_TEMPERATURE") else None
+# Target speech loudness (dBFS RMS) every Qwen take is levelled to, streamed
+# or not; Qwen's own level wanders ~7 dB between takes. "off" disables.
+_loudness = os.getenv("QWEN_TTS_LOUDNESS", "-21").strip().lower()
+QWEN_TTS_LOUDNESS = None if _loudness in ("", "off", "none", "false", "0") else float(_loudness)
 QWEN_TTS_PRELOAD = os.getenv("QWEN_TTS_PRELOAD", "false").strip().lower() in ("1", "true", "yes", "on")
 QWEN_TTS_ALIASES = {"qwen3-tts", "qwen3_tts", "qwen-tts", "qwen"}
 # VoiceDesign: invents a voice from a text description in `instructions`. It
@@ -778,10 +782,66 @@ def resolve_qwen(req: SpeechRequest) -> tuple[str, dict]:
     return QWEN_TTS_MODEL, kwargs
 
 
+class LoudnessLeveler:
+    """Evens out Qwen's take-to-take volume on a stream, chunk by chunk.
+
+    Qwen samples each take's delivery, level included: identical requests
+    measured 7 dB apart. This tracks the loudness of the speech heard so far
+    (silence gated out) and scales each chunk toward the target. It adds no
+    latency: the first chunk's gain comes from that chunk itself, steadied by
+    a prior at Qwen's typical level so a few quiet onset frames can't swing it.
+    The estimate forgets with a few seconds' time constant, so a long
+    multi-sentence request is also levelled as it drifts."""
+
+    FRAME_S = 0.05
+    GATE_DB = -40.0     # frames below this are pauses, not speech
+    PRIOR_DB = -22.5    # Qwen's measured typical speech level
+    PRIOR_S = 0.25      # how much speech the prior counts as
+    TAU_S = 3.0         # memory, in seconds of speech
+    MAX_GAIN_DB = 12.0
+    KNEE = 0.7          # soft-limit above this, so boosted peaks never hard-clip
+
+    def __init__(self, sample_rate: int, target_db: float):
+        self.n = max(1, int(sample_rate * self.FRAME_S))
+        self.target = 10 ** (target_db / 20)
+        self.time = self.PRIOR_S
+        self.energy = 10 ** (self.PRIOR_DB / 10) * self.PRIOR_S
+        self.gain: float | None = None
+
+    def __call__(self, chunk: np.ndarray) -> np.ndarray:
+        if not len(chunk):
+            return chunk
+        whole = len(chunk) // self.n * self.n
+        power = (chunk[:whole].reshape(-1, self.n) ** 2).mean(1) if whole else (chunk ** 2).mean(keepdims=True)
+        speech = power[power > 10 ** (self.GATE_DB / 10)]
+        if len(speech):
+            dt = len(speech) * self.FRAME_S
+            keep = math.exp(-dt / self.TAU_S)
+            self.energy = self.energy * keep + float(speech.sum()) * self.FRAME_S
+            self.time = self.time * keep + dt
+        limit = 10 ** (self.MAX_GAIN_DB / 20)
+        gain = min(max(self.target / math.sqrt(self.energy / self.time), 1 / limit), limit)
+        curve = np.full(len(chunk), gain, dtype=np.float32)
+        if self.gain is not None:
+            # Glide from the last chunk's gain rather than stepping.
+            k = min(len(chunk), 2 * self.n)
+            curve[:k] = np.linspace(self.gain, gain, k, dtype=np.float32)
+        self.gain = gain
+        out = chunk * curve
+        mag = np.abs(out)
+        over = mag > self.KNEE
+        if over.any():
+            room = 1.0 - self.KNEE
+            out[over] = np.sign(out[over]) * (self.KNEE + room * np.tanh((mag[over] - self.KNEE) / room))
+        return out
+
+
 def qwen_generate(repo: str, text: str, kwargs: dict, stream: bool):
-    """Yield float32 audio chunks from Qwen3-TTS. Unknown preset voices raise
-    ValueError from mlx-audio itself, listing the valid ones."""
+    """Yield float32 audio chunks from Qwen3-TTS, levelled to
+    QWEN_TTS_LOUDNESS. Unknown preset voices raise ValueError from mlx-audio
+    itself, listing the valid ones."""
     model = qwen_tts_model(repo)
+    level = LoudnessLeveler(model.sample_rate, QWEN_TTS_LOUDNESS) if QWEN_TTS_LOUDNESS is not None else None
     kwargs = dict({"lang_code": QWEN_TTS_LANGUAGE}, **kwargs, text=split_marks(text)[0])
     if kwargs.get("temperature") is None:
         kwargs["temperature"] = QWEN_TTS_TEMPERATURE
@@ -790,7 +850,8 @@ def qwen_generate(repo: str, text: str, kwargs: dict, stream: bool):
         kwargs.update(stream=True, streaming_interval=0.48)
     for result in model.generate(**kwargs):
         if result.audio is not None:
-            yield np.asarray(result.audio, dtype=np.float32).reshape(-1)
+            chunk = np.asarray(result.audio, dtype=np.float32).reshape(-1)
+            yield level(chunk) if level else chunk
 
 
 def synthesize_qwen(repo: str, text: str, kwargs: dict) -> bytes:

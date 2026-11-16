@@ -573,6 +573,12 @@ curl -s http://localhost:5000/v1/audio/speech/qwen -H 'content-type: application
   from call to call. A lower value is steadier but flatter, and `0` is greedy.
   Streaming doesn't change the output: the same seed gives the same audio
   either way.
+- **Loudness**: Qwen's volume also varies per take (identical requests
+  measured 7 dB apart), so every Qwen output is levelled to
+  `QWEN_TTS_LOUDNESS` (default `-21` dBFS RMS of speech; `off` for the raw
+  model level). It works chunk by chunk on a stream and adds no latency, so
+  it can only react to what it has heard: takes land within ~4 dB of each
+  other rather than exactly equal.
 - **Saved voices** (`"voice": "myvoice"`): any `<name>.wav` (10–20s of speech)
   in `voices/` (`QWEN_TTS_VOICES_DIR`) is a voice, cloned by the Base model on
   every request. New files work without a restart; they're listed under
