@@ -167,6 +167,36 @@ QWEN_TTS_CLONE_LANGUAGE = os.getenv("QWEN_TTS_CLONE_LANGUAGE", "auto")
 # from Kokoro's so a long Qwen generation never queues a Kokoro request.
 QWEN_TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts")
 
+# Higgs TTS 3 (Boson AI): a third TTS engine (mlx-audio, Apple Silicon only),
+# picked with model="higgs-tts" or via /v1/audio/speech/higgs. It clones the
+# same saved voices as Qwen (QWEN_TTS_VOICES_DIR) from the whole clip plus its
+# transcript; a voice with no .txt is cloned from audio alone. Engine details
+# (reference-prefix cache, real streaming) are in higgs_tts.py.
+# Licence: Boson Higgs Audio v3 Research and Non-Commercial License.
+HIGGS_TTS_MODEL = os.getenv("HIGGS_TTS_MODEL", "bosonai/higgs-tts-3-4b")
+# Voice when a request names none: a saved voice, or "" for Higgs's own
+# unconditioned voice (a different speaker on every call).
+HIGGS_TTS_VOICE = os.getenv("HIGGS_TTS_VOICE", "")
+# 0.8 / top-k 50 is what speech-swift and the upstream issue tracker settled on;
+# the checkpoint's 1.0 "wobbles on single sentences". A request's `temperature`
+# overrides.
+HIGGS_TTS_TEMPERATURE = float(os.getenv("HIGGS_TTS_TEMPERATURE", "0.8"))
+HIGGS_TTS_TOP_K = int(os.getenv("HIGGS_TTS_TOP_K", "50")) or None
+_h_loud = os.getenv("HIGGS_TTS_LOUDNESS", _loudness).strip().lower()
+HIGGS_TTS_LOUDNESS = None if _h_loud in ("", "off", "none", "false", "0") else float(_h_loud)
+# Load the model (and the default voice) in the background at startup, so the
+# first request doesn't pay ~5s for it.
+HIGGS_TTS_PRELOAD = os.getenv("HIGGS_TTS_PRELOAD", "false").strip().lower() in ("1", "true", "yes", "on")
+HIGGS_TTS_ALIASES = {"higgs-tts", "higgs_tts", "higgs", "higgs-tts-3", "higgs-audio"}
+# Which engine answers model="qwen3-tts" requests (on /v1/audio/speech and
+# /v1/audio/speech/qwen) that ask for a saved voice or no voice. "higgs" moves
+# existing Qwen clients onto Higgs without touching them; Qwen preset speakers
+# (ryan, …) and qwen3-tts-design always stay on Qwen, and model="qwen3-tts-native"
+# always reaches real Qwen.
+QWEN_TTS_SERVED_BY = os.getenv("QWEN_TTS_SERVED_BY", "qwen").strip().lower()
+QWEN_TTS_NATIVE_ALIASES = {"qwen3-tts-native"}
+HIGGS_TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="higgs-tts")
+
 # Diarization (pyannote): plain PyTorch, so unlike Whisper it runs on MPS. On
 # Apple Silicon this is the one stage the GPU genuinely accelerates, so "auto"
 # is left at the raw auto-detect (no CPU downgrade).
@@ -282,6 +312,25 @@ async def lifespan(app: FastAPI):
             log.warning("Parakeet preload failed (loads on first use instead): %s", e)
 
     state["parakeet_warmup"] = asyncio.create_task(warm_parakeet())
+
+    # Higgs: load, cache the default voice's reference prefix and compile its
+    # kernels in the background, so the server serves at once and the first
+    # Higgs request isn't ~5s late.
+    async def warm_higgs():
+        def _warm():
+            ref = (None, None)
+            if HIGGS_TTS_VOICE:
+                ref = qwen_saved_voices().get(HIGGS_TTS_VOICE.lower(), ref)
+            for _ in higgs_generate("Warming up.", ref, None, True):
+                pass
+        try:
+            await asyncio.get_running_loop().run_in_executor(HIGGS_TTS_EXECUTOR, _warm)
+            log.info("Higgs TTS warmed up.")
+        except Exception as e:
+            log.warning("Higgs preload failed (loads on first use instead): %s", e)
+
+    if HIGGS_TTS_PRELOAD:
+        state["higgs_warmup"] = asyncio.create_task(warm_higgs())
 
     yield
 
@@ -620,7 +669,7 @@ def transcode(wav_bytes: bytes, ffmpeg_args: list[str]) -> bytes:
 
 class SpeechRequest(BaseModel):
     input: str = Field(..., description="Text to synthesize.")
-    model: str = Field("kokoro", description="kokoro (default), qwen3-tts or qwen3-tts-design.")
+    model: str = Field("kokoro", description="kokoro (default), qwen3-tts, qwen3-tts-design or higgs-tts.")
     voice: str = Field(
         DEFAULT_VOICE,
         description=(
@@ -706,7 +755,9 @@ async def encode_audio(wav_bytes: bytes, fmt: str) -> bytes:
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest):
     fmt = check_speech_request(req)
-    if req.model.strip().lower() in QWEN_TTS_ALIASES | QWEN_TTS_DESIGN_ALIASES:
+    if routes_to_higgs(req):
+        return await speak_higgs(req, fmt)
+    if req.model.strip().lower() in QWEN_TTS_ALIASES | QWEN_TTS_DESIGN_ALIASES | QWEN_TTS_NATIVE_ALIASES:
         return await speak_qwen(req, fmt)
     wav_bytes = await run_tts(synthesize, req)
     encoded = await encode_audio(wav_bytes, fmt)
@@ -876,29 +927,37 @@ def streaming_wav_header(sample_rate: int) -> bytes:
 
 
 async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> StreamingResponse:
-    """Stream Qwen3-TTS audio as it's generated. The first chunk is pulled
-    before responding, so a bad voice still becomes a 400 rather than a
-    truncated 200."""
-    loop = asyncio.get_running_loop()
+    """Stream Qwen3-TTS audio as it's generated."""
     gen = qwen_generate(repo, req.input, kwargs, True)
+    return await stream_tts(req, gen, QWEN_TTS_EXECUTOR,
+                            lambda: state["qwen_tts"][repo].sample_rate, fmt, "Qwen3-TTS")
+
+
+async def stream_tts(req: SpeechRequest, gen, executor, sample_rate_of, fmt: str, label: str) -> StreamingResponse:
+    """Stream a TTS chunk generator's audio as it's generated, every step on
+    the engine's own executor. The first chunk is pulled before responding,
+    so a bad voice still becomes a 400 rather than a truncated 200."""
+    loop = asyncio.get_running_loop()
     done = object()
 
     def next_chunk():
         return next(gen, done)
 
     try:
-        first = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+        first = await loop.run_in_executor(executor, next_chunk)
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        log.exception("Qwen3-TTS synthesis failed")
+        log.exception("%s synthesis failed", label)
         raise HTTPException(500, f"TTS failed: {e}")
     if first is done:
-        raise HTTPException(500, "TTS produced no audio (Qwen3-TTS returned no chunks).")
-    sample_rate = state["qwen_tts"][repo].sample_rate
+        raise HTTPException(500, f"TTS produced no audio ({label} returned no chunks).")
+    sample_rate = sample_rate_of()
     if req.timestamps:
         return StreamingResponse(
-            timed_qwen_body(req.input, gen, first, done, next_chunk, sample_rate),
+            timed_qwen_body(req.input, gen, first, done, next_chunk, sample_rate, executor),
             media_type="application/x-ndjson",
         )
 
@@ -911,9 +970,9 @@ async def stream_qwen(req: SpeechRequest, repo: str, kwargs: dict, fmt: str) -> 
             chunk = first
             while chunk is not done:
                 yield pcm16(chunk)
-                chunk = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+                chunk = await loop.run_in_executor(executor, next_chunk)
         finally:
-            await loop.run_in_executor(QWEN_TTS_EXECUTOR, gen.close)
+            await loop.run_in_executor(executor, gen.close)
 
     return StreamingResponse(body(), media_type=SUPPORTED_FORMATS[fmt][0])
 
@@ -1024,12 +1083,16 @@ class WordTimer:
         return events
 
 
-async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: int):
-    """NDJSON stream for timestamps=true: audio events as fast as Qwen makes
-    them, word events as soon as alignment settles. Alignment never waits on
-    or delays the audio; if it fails, the audio still completes."""
+async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: int,
+                          executor=QWEN_TTS_EXECUTOR):
+    """NDJSON stream for timestamps=true: audio events as fast as the engine
+    (Qwen or Higgs) makes them, word events as soon as alignment settles.
+    Alignment never waits on or delays the audio; if it fails, the audio
+    still completes."""
     loop = asyncio.get_running_loop()
-    timer = WordTimer(split_marks(text)[0])
+    # Higgs inline control tokens (<|emotion:…|>) are blanked, not removed, so
+    # word `char` offsets still index the client's own text.
+    timer = WordTimer(HIGGS_CONTROL_RE.sub(lambda m: " " * len(m.group()), split_marks(text)[0]))
     parts: list[np.ndarray] = []
     total = aligned_at = 0
     task: asyncio.Task | None = None
@@ -1067,7 +1130,7 @@ async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: 
             if task is None and not failed and total - aligned_at >= ALIGN_EVERY_S * sample_rate:
                 aligned_at = total
                 task = asyncio.create_task(align(np.concatenate(parts), False))
-            chunk = await loop.run_in_executor(QWEN_TTS_EXECUTOR, next_chunk)
+            chunk = await loop.run_in_executor(executor, next_chunk)
         if task is not None:
             for out in await collect(task):
                 yield out
@@ -1079,7 +1142,7 @@ async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: 
     finally:
         if task is not None and not task.done():
             task.cancel()
-        await loop.run_in_executor(QWEN_TTS_EXECUTOR, gen.close)
+        await loop.run_in_executor(executor, gen.close)
 
 
 async def speak_qwen(req: SpeechRequest, fmt: str) -> Response:
@@ -1109,9 +1172,117 @@ async def speak_qwen(req: SpeechRequest, fmt: str) -> Response:
 async def speech_qwen(req: SpeechRequest):
     """Same as /v1/audio/speech with model="qwen3-tts" (or qwen3-tts-design,
     if that's what `model` says)."""
-    if req.model.strip().lower() not in QWEN_TTS_DESIGN_ALIASES:
+    if req.model.strip().lower() not in QWEN_TTS_DESIGN_ALIASES | QWEN_TTS_NATIVE_ALIASES:
         req.model = "qwen3-tts"
-    return await speak_qwen(req, check_speech_request(req))
+    fmt = check_speech_request(req)
+    if routes_to_higgs(req):
+        return await speak_higgs(req, fmt)
+    return await speak_qwen(req, fmt)
+
+
+# ---------------------------------------------------------------------------
+# Higgs TTS 3
+# ---------------------------------------------------------------------------
+
+HIGGS_CONTROL_RE = re.compile(r"<\|[^|<>]*\|>")
+
+
+def higgs_voice_name(req: SpeechRequest) -> str:
+    """The voice a Higgs request asked for, or HIGGS_TTS_VOICE if it named none."""
+    return (req.voice if "voice" in req.model_fields_set else HIGGS_TTS_VOICE).strip().lower()
+
+
+def routes_to_higgs(req: SpeechRequest) -> bool:
+    model = req.model.strip().lower()
+    if model in HIGGS_TTS_ALIASES:
+        return True
+    if model not in QWEN_TTS_ALIASES or QWEN_TTS_SERVED_BY != "higgs":
+        return False
+    # Only what Higgs can actually voice: a saved voice, or no voice at all
+    # when Higgs has a default. Qwen preset speakers keep going to Qwen.
+    if "voice" not in req.model_fields_set:
+        return bool(HIGGS_TTS_VOICE)
+    return req.voice.strip().lower() in qwen_saved_voices()
+
+
+def higgs_engine():
+    """Return the Higgs engine, loading it on first call. Must run on
+    HIGGS_TTS_EXECUTOR (MLX is thread-affine; the one thread also serializes loads)."""
+    engine = state.get("higgs_tts")
+    if engine is None:
+        from higgs_tts import HiggsEngine
+
+        log.info("Loading Higgs TTS 3: %s (MLX/Metal)", HIGGS_TTS_MODEL)
+        engine = state["higgs_tts"] = HiggsEngine(HIGGS_TTS_MODEL)
+        log.info("Higgs TTS 3 loaded.")
+    return engine
+
+
+def resolve_higgs(req: SpeechRequest) -> tuple[str | None, str | None]:
+    """(reference wav, its transcript) for a request; (None, None) = no clone."""
+    name = higgs_voice_name(req)
+    if not name:
+        return None, None
+    saved = qwen_saved_voices()
+    if name not in saved:
+        raise HTTPException(
+            400,
+            f"Unknown Higgs voice {name!r}. Saved voices: {', '.join(sorted(saved)) or 'none'} "
+            f"(add <name>.wav + <name>.txt to {QWEN_TTS_VOICES_DIR}/).",
+        )
+    return saved[name]
+
+
+def higgs_generate(text: str, ref: tuple[str | None, str | None], temperature: float | None, stream: bool):
+    """Yield float32 audio chunks from Higgs, levelled to HIGGS_TTS_LOUDNESS."""
+    engine = higgs_engine()
+    level = LoudnessLeveler(engine.sample_rate, HIGGS_TTS_LOUDNESS) if HIGGS_TTS_LOUDNESS is not None else None
+    for chunk in engine.generate(
+        split_marks(text)[0], ref[0], ref[1],
+        temperature=HIGGS_TTS_TEMPERATURE if temperature is None else temperature,
+        top_k=HIGGS_TTS_TOP_K, stream=stream,
+    ):
+        yield level(chunk) if level else chunk
+
+
+def synthesize_higgs(text: str, ref: tuple, temperature: float | None) -> bytes:
+    chunks = list(higgs_generate(text, ref, temperature, False))
+    if not chunks:
+        return b""
+    return to_wav_bytes(np.concatenate(chunks), state["higgs_tts"].sample_rate)
+
+
+async def speak_higgs(req: SpeechRequest, fmt: str) -> Response:
+    ref = resolve_higgs(req)
+    if req.timestamps and not req.stream:
+        raise HTTPException(400, "timestamps=true needs stream=true.")
+    if req.stream:
+        if fmt not in ("wav", "pcm"):
+            raise HTTPException(400, "stream=true supports response_format wav or pcm only.")
+        gen = higgs_generate(req.input, ref, req.temperature, True)
+        return await stream_tts(req, gen, HIGGS_TTS_EXECUTOR,
+                                lambda: state["higgs_tts"].sample_rate, fmt, "Higgs TTS")
+    loop = asyncio.get_running_loop()
+    try:
+        wav_bytes = await loop.run_in_executor(
+            HIGGS_TTS_EXECUTOR, synthesize_higgs, req.input, ref, req.temperature
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.exception("Higgs TTS synthesis failed")
+        raise HTTPException(500, f"TTS failed: {e}")
+    if not wav_bytes:
+        raise HTTPException(500, "TTS produced no audio (Higgs TTS returned no chunks).")
+    encoded = await encode_audio(wav_bytes, fmt)
+    return Response(content=encoded, media_type=SUPPORTED_FORMATS[fmt][0])
+
+
+@app.post("/v1/audio/speech/higgs")
+async def speech_higgs(req: SpeechRequest):
+    """Same as /v1/audio/speech with model="higgs-tts"."""
+    req.model = "higgs-tts"
+    return await speak_higgs(req, check_speech_request(req))
 
 
 class TimedSpeechRequest(SpeechRequest):
@@ -1540,6 +1711,18 @@ async def health():
             "base_model": QWEN_TTS_BASE_MODEL,
             "saved_voices": sorted(qwen_saved_voices()),
             "loaded": sorted(state.get("qwen_tts", {})),
+            # Additive: "higgs" = saved-voice qwen3-tts requests are served by Higgs.
+            "served_by": QWEN_TTS_SERVED_BY,
+        },
+        # Additive: third TTS engine (model="higgs-tts").
+        "higgs_tts": {
+            "model": HIGGS_TTS_MODEL,
+            "voice": HIGGS_TTS_VOICE,
+            "temperature": HIGGS_TTS_TEMPERATURE,
+            "top_k": HIGGS_TTS_TOP_K,
+            "device": "mps",
+            "saved_voices": sorted(qwen_saved_voices()),
+            "loaded": state.get("higgs_tts") is not None,
         },
         # Additive: diarization loads lazily, so "loaded" says whether the
         # first request has paid for it yet. Existing keys are untouched.
@@ -1559,12 +1742,16 @@ async def list_models():
             {"id": "kokoro", "object": "model", "owned_by": "hexgrad"},
             {"id": "qwen3-tts", "object": "model", "owned_by": "qwen"},
             {"id": "qwen3-tts-design", "object": "model", "owned_by": "qwen"},
+            {"id": "higgs-tts", "object": "model", "owned_by": "bosonai"},
         ],
     }
 
 
 @app.get("/v1/voices")
 async def list_voices(model: str | None = None):
+    if (model or "").strip().lower() in HIGGS_TTS_ALIASES:
+        # Higgs has no preset speakers; every voice is a saved clip.
+        return {"voices": sorted(qwen_saved_voices()), "default": HIGGS_TTS_VOICE}
     if (model or "").strip().lower() in QWEN_TTS_ALIASES:
         qwen = await asyncio.get_running_loop().run_in_executor(QWEN_TTS_EXECUTOR, qwen_tts_model)
         return {

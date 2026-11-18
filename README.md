@@ -670,6 +670,82 @@ RTF = compute time ÷ audio length (below 1 is faster than real time).
 - **Alongside Kokoro:** during a 15s Qwen job, Kokoro requests went from
   0.24s to 0.30s and Parakeet STT was unaffected.
 
+## Higgs TTS 3 (third TTS engine)
+
+[Higgs TTS 3](https://www.boson.ai/blog/higgs-audio-v3-tts) (Boson AI,
+`bosonai/higgs-tts-3-4b`, a 4B Qwen3-backed model) clones the same saved voices
+in `voices/` that Qwen uses. It reads the whole clip plus its `.txt` transcript,
+and a voice without a `.txt` is cloned from the audio alone. It also accepts
+inline control tags: `<|emotion:amusement|>`, `<|style:whispering|>`,
+`<|prosody:pause|>`, and `<|sfx:laughter|>Haha.` (follow a sound-effect tag
+with matching written onomatopoeia). **Licence:** Boson Higgs Audio v3 Research
+and Non-Commercial.
+
+```bash
+curl -X POST http://HOST:5000/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model":"higgs-tts","voice":"myvoice","input":"Hello there.","stream":true}' -o out.wav
+# or POST /v1/audio/speech/higgs, where `model` is optional
+```
+
+Same request fields as Qwen: `stream` and `timestamps` (identical NDJSON
+events; control tags are blanked, so word `char` offsets still index your
+text), `temperature` (default `HIGGS_TTS_TEMPERATURE=0.8`), and loudness
+levelling (`HIGGS_TTS_LOUDNESS`, which defaults to Qwen's). `speed`,
+`instructions` and `xvec_only` are ignored. A request without `voice` gets
+`HIGGS_TTS_VOICE`; when that is empty, Higgs uses an unconditioned voice that
+changes on every call. `/v1/voices?model=higgs` lists the voices.
+
+**Making it the default for existing Qwen clients:** with
+`QWEN_TTS_SERVED_BY=higgs`, a `model: "qwen3-tts"` request (on either route)
+for a saved voice, or for no voice when `HIGGS_TTS_VOICE` is set, is answered
+by Higgs. Qwen preset speakers (`ryan`, …) and `qwen3-tts-design` still go to
+Qwen, and `model: "qwen3-tts-native"` always reaches real Qwen. `/health`
+shows the setting as `qwen_tts.served_by`.
+
+**Setup:** mlx-audio ≥ 0.6.2 already includes the model. The bf16 checkpoint
+(9.3 GB) works as is. For the faster 8-bit copy, run
+`python3 deploy/quantize_higgs.py ~/models/higgs-tts-3-4b-8bit` and point
+`HIGGS_TTS_MODEL` at it. mlx-audio's own converter drops the audio codec; the
+script puts it back. `HIGGS_TTS_PRELOAD=true` loads the model and caches the
+default voice in the background at startup (~5s).
+
+**How it's driven** (`higgs_tts.py`): mlx-audio's `generate()` doesn't stream
+(it returns the whole take at the end, even with `stream=True`), and it
+re-processes the reference clip on every call (~1s for a 17s clip). cleanTTS
+runs its own loop instead:
+
+- It caches the voice's reference prefix per voice, so a request prefills only
+  its own text.
+- It decodes the codec in sliding windows: 12 frames of left context and 8 of
+  lookahead, at 40 ms per frame. Streamed audio matches a one-shot decode to
+  within 0.005 peak.
+- It pads the reference with 0.5s of silence. Without the padding, a test
+  clip made Higgs swallow a paragraph's opening "I" in 9 of 12 takes; with it,
+  0 of 12.
+
+### Higgs vs Qwen3-TTS, measured (2026-11-18)
+
+M1 Max (32 GB), MLX, a cloned voice, warm, 5 lines × 4 seeds each, cleanTTS
+stopped. Qwen = the 1.7B Base 8bit speaker-only clone, as served.
+
+| | first audio, streamed (in-process / over HTTP) | RTF | peak mem | WER (Whisper turbo) | speaker sim. to real clip | median F0 (real: 97 Hz) |
+|---|---|---|---|---|---|---|
+| Qwen3-TTS 1.7B 8bit | **0.22s / ~0.3–0.4s** | **0.39** | **3.8 GB** | 2.7% | 0.625 | 111 Hz |
+| Higgs TTS 3, bf16 (mlx-audio generate) | 2.0–14s (no streaming) | 0.83–1.27 | 9.4–12.5 GB | — | — | — |
+| Higgs TTS 3, 6bit | — | 0.62–1.17 | 4.7–7.7 GB | — | — | — |
+| **Higgs TTS 3, 8bit, cleanTTS engine** | 0.42s / ~0.5s | 0.63 | 5.7–6.6 GB | 3.2% | **0.647** | 117 Hz |
+
+- Higgs is ~1.6x slower than Qwen, but it still runs well ahead of real time,
+  so streamed playback doesn't stall. It costs ~0.2s more before the first
+  sound.
+- Both engines are about equal on the objective metrics. The WER residue is the
+  same for both ("three" → "3", "Krzysztof" → "Kristoff"). Higgs is slightly
+  closer to the real voice. Its advantage (Boson's EmergentTTS-Eval: 53.7% vs
+  Qwen3-TTS-1.7B's 38.8% overall win-rate) is expressiveness, which these
+  numbers don't capture. Judge by ear.
+- 6bit is no faster than 8bit. Per-step time is dominated by more than weight
+  bandwidth.
+
 ---
 
 ## Voices
