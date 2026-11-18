@@ -678,7 +678,10 @@ in `voices/` that Qwen uses. It reads the whole clip plus its `.txt` transcript,
 and a voice without a `.txt` is cloned from the audio alone. It also accepts
 inline control tags: `<|emotion:amusement|>`, `<|style:whispering|>`,
 `<|prosody:pause|>`, and `<|sfx:laughter|>Haha.` (follow a sound-effect tag
-with matching written onomatopoeia). **Licence:** Boson Higgs Audio v3 Research
+with matching written onomatopoeia). The full list of 43 tags is in the
+model's `PROMPTING.md` on Hugging Face. Clients can send tags to any engine:
+Kokoro and Qwen strip them (as they do `<mark/>` tags) instead of reading
+them aloud. **Licence:** Boson Higgs Audio v3 Research
 and Non-Commercial.
 
 ```bash

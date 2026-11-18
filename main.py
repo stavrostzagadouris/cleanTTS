@@ -468,20 +468,39 @@ def to_wav_bytes(wav: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RATE) -> byte
 # SSML-style cue markers for /v1/audio/speech/timed: <mark name="slide2"/>.
 # Stripped before synthesis on every route so they're never read aloud.
 MARK_RE = re.compile(r"""<mark\s+name\s*=\s*["']([^"']*)["']\s*/?>""", re.IGNORECASE)
+# Higgs TTS 3 inline control tags: <|emotion:elation|>, <|sfx:laughter|>, …
+# Only Higgs understands them; every other engine would read them aloud, so
+# split_marks strips them unless the caller is Higgs (keep_tags=True).
+HIGGS_CONTROL_RE = re.compile(r"<\|[^|<>]*\|>")
+MARK_OR_TAG_RE = re.compile(f"{MARK_RE.pattern}|{HIGGS_CONTROL_RE.pattern}", re.IGNORECASE)
 
 
-def split_marks(text: str) -> tuple[str, list[tuple[str, int]]]:
-    """Remove <mark name="..."/> tags; return (clean text, [(name, char
-    offset into the clean text)])."""
+def split_marks(text: str, keep_tags: bool = False) -> tuple[str, list[tuple[str, int]]]:
+    """Remove <mark name="..."/> tags, and Higgs control tags unless
+    keep_tags; return (clean text, [(name, char offset into the clean text)])."""
     parts: list[str] = []
     marks: list[tuple[str, int]] = []
     pos = 0
     length = 0
-    for m in MARK_RE.finditer(text):
+    for m in (MARK_RE if keep_tags else MARK_OR_TAG_RE).finditer(text):
         parts.append(text[pos:m.start()])
         length += m.start() - pos
-        marks.append((m.group(1), length))
-        pos = m.end()
+        if m.group(1) is not None:      # a mark, not a stripped Higgs tag
+            marks.append((m.group(1), length))
+            pos = m.end()
+        else:
+            # A stripped tag leaves one space, not two or none:
+            # "it <|prosody:pause|> the" -> "it the" (a double space shows up
+            # in Kokoro's word timings as " the"), and
+            # "pal.<|sfx:laughter|>Haha" -> "pal. Haha", not "pal.Haha".
+            pos = m.end()
+            before = "".join(parts)[-1:]
+            after = text[pos:pos + 1]
+            if after.isspace() and (not before or before.isspace()):
+                pos += 1
+            elif before and after and not before.isspace() and not after.isspace() and after != "<":
+                parts.append(" ")
+                length += 1
     parts.append(text[pos:])
     return "".join(parts), marks
 
@@ -1092,7 +1111,7 @@ async def timed_qwen_body(text: str, gen, first, done, next_chunk, sample_rate: 
     loop = asyncio.get_running_loop()
     # Higgs inline control tokens (<|emotion:…|>) are blanked, not removed, so
     # word `char` offsets still index the client's own text.
-    timer = WordTimer(HIGGS_CONTROL_RE.sub(lambda m: " " * len(m.group()), split_marks(text)[0]))
+    timer = WordTimer(HIGGS_CONTROL_RE.sub(lambda m: " " * len(m.group()), split_marks(text, keep_tags=True)[0]))
     parts: list[np.ndarray] = []
     total = aligned_at = 0
     task: asyncio.Task | None = None
@@ -1184,9 +1203,6 @@ async def speech_qwen(req: SpeechRequest):
 # Higgs TTS 3
 # ---------------------------------------------------------------------------
 
-HIGGS_CONTROL_RE = re.compile(r"<\|[^|<>]*\|>")
-
-
 def higgs_voice_name(req: SpeechRequest) -> str:
     """The voice a Higgs request asked for, or HIGGS_TTS_VOICE if it named none."""
     return (req.voice if "voice" in req.model_fields_set else HIGGS_TTS_VOICE).strip().lower()
@@ -1238,7 +1254,7 @@ def higgs_generate(text: str, ref: tuple[str | None, str | None], temperature: f
     engine = higgs_engine()
     level = LoudnessLeveler(engine.sample_rate, HIGGS_TTS_LOUDNESS) if HIGGS_TTS_LOUDNESS is not None else None
     for chunk in engine.generate(
-        split_marks(text)[0], ref[0], ref[1],
+        split_marks(text, keep_tags=True)[0], ref[0], ref[1],
         temperature=HIGGS_TTS_TEMPERATURE if temperature is None else temperature,
         top_k=HIGGS_TTS_TOP_K, stream=stream,
     ):
