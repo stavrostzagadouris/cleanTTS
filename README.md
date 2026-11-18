@@ -10,8 +10,8 @@ NOTE this is all a Claude vibecode special. Claude, take it from here:
 - **STT**: `faster-whisper` (local; CUDA or CPU), or Parakeet via
   `parakeet-mlx` on Apple Silicon
 - **TTS**: Kokoro-82M, via `mlx-audio` on Apple Silicon or the `kokoro` pip
-  package (PyTorch) everywhere else; optionally Qwen3-TTS via `mlx-audio`
-  (Apple Silicon only)
+  package (PyTorch) everywhere else; optionally Qwen3-TTS and Higgs TTS 3 via
+  `mlx-audio` (Apple Silicon only)
 - **Diarization**: `pyannote.audio` (optional, loads on first use)
 - **Web**: FastAPI
 
@@ -25,12 +25,24 @@ One process, one port (default `5000`). No Docker, no vLLM-omni, no Voxtral.
 |---|---|
 | `POST /v1/audio/speech` | OpenAI-compatible TTS — call this from any external tool |
 | `POST /v1/audio/speech/qwen` | Same TTS on Qwen3-TTS instead of Kokoro (or send `model: "qwen3-tts"` to `/v1/audio/speech`) — see [Qwen3-TTS](#qwen3-tts-second-tts-engine) |
+| `POST /v1/audio/speech/higgs` | Same TTS on Higgs TTS 3 (or send `model: "higgs-tts"` to `/v1/audio/speech`) — see [Higgs TTS 3](#higgs-tts-3-third-tts-engine) |
 | `POST /v1/audio/speech/timed` | Same TTS, as JSON with word/sentence timings, cue markers and optional VTT/SRT subtitles |
 | `POST /v1/audio/transcriptions` | OpenAI-compatible STT — two engines (Whisper on CPU, Parakeet on GPU), picked per request |
 | `POST /v1/audio/diarize` | Speaker diarization — "who spoke when" (pyannote; CUDA or MPS) |
-| `GET /v1/voices` | Available Kokoro voices (`?model=qwen3-tts` for Qwen's preset and saved voices) |
-| `GET /v1/models` | OpenAI-compat model list (`kokoro`, `qwen3-tts`, `qwen3-tts-design`) |
+| `GET /v1/voices` | Available Kokoro voices (`?model=qwen3-tts` for Qwen's preset and saved voices, `?model=higgs` for Higgs's saved voices) |
+| `GET /v1/models` | OpenAI-compat model list (`kokoro`, `qwen3-tts`, `qwen3-tts-design`, `higgs-tts`) |
 | `GET /health` | Liveness + which models/devices are loaded |
+
+### Changes on 2026-11-18
+
+- **Added: Higgs TTS 3** as an opt-in third TTS engine. It clones the same
+  saved voices as Qwen, streams, supports `timestamps`, and takes inline
+  emotion/style/sound-effect tags. Setting `QWEN_TTS_SERVED_BY=higgs` moves
+  existing saved-voice `qwen3-tts` clients onto it without any client change.
+  The defaults are unchanged: Kokoro, and Qwen for `qwen3-tts`. See
+  [Higgs TTS 3](#higgs-tts-3-third-tts-engine).
+- **Higgs tags are never read aloud.** Kokoro and Qwen strip
+  `<|emotion:…|>`-style tags, as they already did `<mark/>` tags.
 
 ### Changes on 2026-10-29
 
@@ -128,13 +140,14 @@ KOKORO_BACKEND=auto                            # auto | torch | mlx (auto = mlx 
 KOKORO_DEVICE=auto                             # auto | cuda | mps | cpu (torch backend only)
 DEFAULT_VOICE=af_bella
 QWEN_TTS_PRELOAD=false                         # true = load the Qwen3-TTS models at startup
+HIGGS_TTS_PRELOAD=false                        # true = load Higgs TTS 3 (+ default voice) at startup
 HOST=0.0.0.0
 PORT=5000
 ```
 
 That's the common subset. `.env.example` documents every option, including
 `STT_MODEL`, `WHISPER_BEAM_SIZE`, `WHISPER_VAD_FILTER`, `KOKORO_MLX_MODEL`,
-`DIARIZE_DEVICE`, `HF_TOKEN` and the `QWEN_TTS_*` settings.
+`DIARIZE_DEVICE`, `HF_TOKEN`, and the `QWEN_TTS_*` and `HIGGS_TTS_*` settings.
 
 ---
 
@@ -149,7 +162,8 @@ First start: the Kokoro weights (~300MB) and the default STT model (e.g.
 download from HuggingFace into the local cache. Subsequent starts are fast.
 Startup ends with one throwaway synthesis per language, so the first real
 request doesn't pay Kokoro's setup cost. Qwen3-TTS weights (~3 GB per model)
-download on first use, or at startup with `QWEN_TTS_PRELOAD=true`.
+download on first use, or at startup with `QWEN_TTS_PRELOAD=true`; Higgs TTS 3
+(9.3 GB bf16, or ~4.8 GB as an 8-bit copy) likewise, or with `HIGGS_TTS_PRELOAD=true`.
 
 ---
 
@@ -510,7 +524,10 @@ curl -s http://localhost:5000/v1/audio/speech/timed \
 - `GET /v1/voices` — voices currently loaded on the server (depends on
   `KOKORO_LANGS`)
 - `GET /v1/voices?model=qwen3-tts` — Qwen3-TTS speakers (loads the model)
-- `GET /v1/models` — OpenAI-compat model list (`kokoro`, `qwen3-tts`)
+- `GET /v1/voices?model=higgs` — saved voices Higgs can clone
+- `GET /v1/models` — OpenAI-compat model list (`kokoro`, `qwen3-tts`,
+  `qwen3-tts-design`, `higgs-tts`)
+- `GET /health` — `higgs_tts` block, and `qwen_tts.served_by`
 
 ---
 
